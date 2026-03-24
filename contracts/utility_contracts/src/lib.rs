@@ -108,6 +108,7 @@ impl UtilityContract {
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 
+    #[allow(deprecated)]
     pub fn deduct_units(env: Env, meter_id: u64, units_consumed: i128) {
         let oracle: Address = env.storage().instance().get(&DataKey::Oracle).expect("Oracle address not set");
         oracle.require_auth();

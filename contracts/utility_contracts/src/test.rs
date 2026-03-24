@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(deprecated)]
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -54,8 +55,6 @@ fn test_utility_flow() {
     // 3. Report usage (billing by units)
     let units_consumed = 15; // 15 kWh
     client.deduct_units(&meter_id, &units_consumed);
-    
-    let meter = client.get_meter(&meter_id).unwrap();
 
     let meter = client.get_meter(&meter_id).unwrap();
     assert_eq!(meter.balance, 350); // 500 - 150 = 350
@@ -106,8 +105,8 @@ fn test_utility_flow() {
     assert_eq!(meter_2.is_active, true); // Should now be active
 
     // Test claim that drops below minimum
-    env.ledger().set_timestamp(env.ledger().timestamp() + 100); // 100 seconds pass
-    client.claim(&meter_id_2); // This should claim 1000 tokens (100 * 10)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10); // 10 seconds pass
+    client.claim(&meter_id_2); // This should claim 100 tokens (10 * 10)
     let meter_2 = client.get_meter(&meter_id_2).unwrap();
     assert_eq!(meter_2.balance, 400); // 500 - 100 = 400
     assert_eq!(meter_2.is_active, false); // Should be deactivated
