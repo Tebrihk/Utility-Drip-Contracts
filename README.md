@@ -25,3 +25,5 @@ This repository uses the recommended structure for a Soroban project:
 - **Network:** Stellar Testnet
 - **Contract ID:** CB7PSJZALNWNX7NLOAM6LOEL4OJZMFPQZJMIYO522ZSACYWXTZIDEDSS
 
+## Additional Documentation
+- [Hardware Spec Integration](HARDWARE.md)

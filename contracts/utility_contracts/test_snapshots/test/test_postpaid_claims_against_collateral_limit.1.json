@@ -38,7 +38,7 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
                 },
                 {
-                  "i128": "10000"
+                  "i128": "500"
                 }
               ]
             }
@@ -54,7 +54,7 @@
           "function": {
             "contract_fn": {
               "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "register_meter",
+              "function_name": "register_meter_with_mode",
               "args": [
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
@@ -63,32 +63,17 @@
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                 },
                 {
-                  "i128": "100"
+                  "i128": "10"
                 },
                 {
                   "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
-                }
-              ]
-            }
-          },
-          "sub_invocations": []
-        }
-      ]
-    ],
-    [
-      [
-        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-        {
-          "function": {
-            "contract_fn": {
-              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-              "function_name": "set_max_flow_rate",
-              "args": [
-                {
-                  "u64": "1"
                 },
                 {
-                  "i128": "5000"
+                  "vec": [
+                    {
+                      "symbol": "PostPaid"
+                    }
+                  ]
                 }
               ]
             }
@@ -110,7 +95,7 @@
                   "u64": "1"
                 },
                 {
-                  "i128": "10000"
+                  "i128": "300"
                 }
               ]
             }
@@ -129,7 +114,7 @@
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
                     },
                     {
-                      "i128": "10000"
+                      "i128": "300"
                     }
                   ]
                 }
@@ -140,6 +125,8 @@
         }
       ]
     ],
+    [],
+    [],
     [
       [
         "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
@@ -159,12 +146,36 @@
         }
       ]
     ],
+    [],
+    [],
+    [],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+              "function_name": "claim",
+              "args": [
+                {
+                  "u64": "1"
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [],
+    [],
     []
   ],
   "ledger": {
     "protocol_version": 25,
     "sequence_number": 0,
-    "timestamp": 120,
+    "timestamp": 35,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
     "min_persistent_entry_ttl": 4096,
@@ -257,7 +268,7 @@
                               "symbol": "balance"
                             },
                             "val": {
-                              "i128": "5000"
+                              "i128": "0"
                             }
                           },
                           {
@@ -267,7 +278,7 @@
                             "val": {
                               "vec": [
                                 {
-                                  "symbol": "PrePaid"
+                                  "symbol": "PostPaid"
                                 }
                               ]
                             }
@@ -277,7 +288,7 @@
                               "symbol": "claimed_this_hour"
                             },
                             "val": {
-                              "i128": "5000"
+                              "i128": "300"
                             }
                           },
                           {
@@ -285,7 +296,7 @@
                               "symbol": "collateral_limit"
                             },
                             "val": {
-                              "i128": "0"
+                              "i128": "300"
                             }
                           },
                           {
@@ -293,7 +304,7 @@
                               "symbol": "debt"
                             },
                             "val": {
-                              "i128": "0"
+                              "i128": "300"
                             }
                           },
                           {
@@ -309,7 +320,7 @@
                               "symbol": "is_active"
                             },
                             "val": {
-                              "bool": true
+                              "bool": false
                             }
                           },
                           {
@@ -325,7 +336,7 @@
                               "symbol": "last_update"
                             },
                             "val": {
-                              "u64": "120"
+                              "u64": "35"
                             }
                           },
                           {
@@ -333,7 +344,7 @@
                               "symbol": "max_flow_rate_per_hour"
                             },
                             "val": {
-                              "i128": "5000"
+                              "i128": "36000"
                             }
                           },
                           {
@@ -349,7 +360,15 @@
                               "symbol": "rate_per_second"
                             },
                             "val": {
-                              "i128": "100"
+                              "i128": "10"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "rate_per_unit"
+                            },
+                            "val": {
+                              "i128": "10"
                             }
                           },
                           {
@@ -458,6 +477,26 @@
               "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
               "key": {
                 "ledger_key_nonce": {
+                  "nonce": "4837995959683129791"
+                }
+              },
+              "durability": "temporary",
+              "val": "void"
+            }
+          },
+          "ext": "v0"
+        },
+        "live_until": 6311999
+      },
+      {
+        "entry": {
+          "last_modified_ledger_seq": 0,
+          "data": {
+            "contract_data": {
+              "ext": "v0",
+              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
+              "key": {
+                "ledger_key_nonce": {
                   "nonce": "2032731177588607455"
                 }
               },
@@ -479,26 +518,6 @@
               "key": {
                 "ledger_key_nonce": {
                   "nonce": "4270020994084947596"
-                }
-              },
-              "durability": "temporary",
-              "val": "void"
-            }
-          },
-          "ext": "v0"
-        },
-        "live_until": 6311999
-      },
-      {
-        "entry": {
-          "last_modified_ledger_seq": 0,
-          "data": {
-            "contract_data": {
-              "ext": "v0",
-              "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M",
-              "key": {
-                "ledger_key_nonce": {
-                  "nonce": "4837995959683129791"
                 }
               },
               "durability": "temporary",
@@ -554,7 +573,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "5000"
+                      "i128": "0"
                     }
                   },
                   {
@@ -606,7 +625,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "0"
+                      "i128": "200"
                     }
                   },
                   {
@@ -658,7 +677,7 @@
                       "symbol": "amount"
                     },
                     "val": {
-                      "i128": "5000"
+                      "i128": "300"
                     }
                   },
                   {
