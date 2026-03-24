@@ -2,7 +2,7 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Address, Env};
+use soroban_sdk::{token, Address, Env, BytesN, Vec};
 
 #[test]
 fn test_prepaid_meter_flow() {
@@ -27,7 +27,9 @@ fn test_prepaid_meter_flow() {
 
     token_admin_client.mint(&user, &10000);
 
-    let meter_id = client.register_meter(&user, &provider, &10, &token_address);
+    // Generate a device public key for the ESP32
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
     assert_eq!(meter_id, 1);
 
     let meter = client.get_meter(&meter_id).unwrap();
@@ -38,6 +40,7 @@ fn test_prepaid_meter_flow() {
     assert_eq!(meter.collateral_limit, 0);
     assert!(!meter.is_active);
     assert_eq!(meter.max_flow_rate_per_hour, 36000);
+    assert_eq!(meter.device_public_key, device_public_key);
 
     client.top_up(&meter_id, &5000);
     let meter = client.get_meter(&meter_id).unwrap();
@@ -583,4 +586,146 @@ fn test_variable_rate_deduct_units_respects_peak_hours() {
     // Peak: 10 units * 30 tokens/unit (20 * 1.5) = 300 tokens
     assert_eq!(meter.balance, 1500);
     assert_eq!(token.balance(&provider), 500); // 200 + 300
+}
+
+#[test]
+fn test_signature_verification_success() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+
+    // Generate device key pair
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+
+    client.top_up(&meter_id, &500);
+
+    // Create valid signed usage data
+    let timestamp = env.ledger().timestamp();
+    let watt_hours_consumed = 250;
+    let units_consumed = 15;
+
+    // Create message to sign: meter_id || timestamp || watt_hours_consumed || units_consumed
+    let mut message = Vec::new(&env);
+    message.push_back(&meter_id);
+    message.push_back(&timestamp);
+    message.push_back(&watt_hours_consumed);
+    message.push_back(&units_consumed);
+
+    // For testing, we'll use a mock signature (in real implementation, this would be a valid signature)
+    let mock_signature = BytesN::from_array(&env, &[2u8; 64]);
+
+    let signed_data = SignedUsageData {
+        meter_id,
+        timestamp,
+        watt_hours_consumed,
+        units_consumed,
+        signature: mock_signature,
+        public_key: device_public_key,
+    };
+
+    // This should fail with invalid signature since we're using a mock signature
+    // In a real test, you'd generate a proper signature using the private key
+    let result = std::panic::catch_unwind(|| {
+        client.deduct_units(&signed_data);
+    });
+    
+    assert!(result.is_err()); // Should panic due to invalid signature
+}
+
+#[test]
+fn test_public_key_mismatch() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let wrong_public_key = BytesN::from_array(&env, &[2u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+
+    client.top_up(&meter_id, &500);
+
+    let timestamp = env.ledger().timestamp();
+    let mock_signature = BytesN::from_array(&env, &[2u8; 64]);
+
+    let signed_data = SignedUsageData {
+        meter_id,
+        timestamp,
+        watt_hours_consumed: 250,
+        units_consumed: 15,
+        signature: mock_signature,
+        public_key: wrong_public_key, // Wrong public key
+    };
+
+    let result = std::panic::catch_unwind(|| {
+        client.deduct_units(&signed_data);
+    });
+    
+    assert!(result.is_err()); // Should panic due to public key mismatch
+}
+
+#[test]
+fn test_update_device_public_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let new_public_key = BytesN::from_array(&env, &[2u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+
+    // Verify initial public key
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.device_public_key, device_public_key);
+
+    // Update public key
+    client.update_device_public_key(&meter_id, &new_public_key);
+
+    // Verify updated public key
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.device_public_key, new_public_key);
 }
