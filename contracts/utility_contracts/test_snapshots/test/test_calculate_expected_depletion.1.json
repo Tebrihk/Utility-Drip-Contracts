@@ -340,7 +340,7 @@
                           },
                           {
                             "key": {
-                              "symbol": "rate_per_second"
+                              "symbol": "rate_per_unit"
                             },
                             "val": {
                               "i128": "10"

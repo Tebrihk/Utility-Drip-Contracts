@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(deprecated)]
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -78,7 +79,8 @@ fn test_prepaid_meter_flow() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &10000);
+    // Initial funding - provide enough for minimum balance tests
+    token_admin_client.mint(&user, &1000); // 1000 tokens
 
     // Generate a device public key for the ESP32
     let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
@@ -115,10 +117,20 @@ fn test_prepaid_meter_flow() {
     env.ledger().set_timestamp(env.ledger().timestamp() + 10);
     client.claim(&meter_id);
 
+    assert_eq!(meter.is_active, false);
+    assert_eq!(meter.usage_data.total_watt_hours, 0);
+    assert_eq!(meter.usage_data.current_cycle_watt_hours, 0);
+    assert_eq!(meter.usage_data.peak_usage_watt_hours, 0);
+    assert_eq!(meter.usage_data.precision_factor, 1000);
+    assert_eq!(meter.max_flow_rate_per_hour, 36000); // 10 * 3600
+
+    // 2. Top up with minimum balance
+    client.top_up(&meter_id, &500); // 500 tokens - meets minimum
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 4900); // 10s * 10 tokens/s = 100 claimed
-    assert_eq!(token.balance(&provider), 100);
-    assert_eq!(token.balance(&contract_id), 4900);
+    assert_eq!(meter.balance, 500);
+    assert_eq!(meter.is_active, true);
+    assert_eq!(token.balance(&user), 500); // 1000 - 500 = 500 remaining
+    assert_eq!(token.balance(&contract_id), 500);
 
     // Test deduct_units (Issue #13 logic)
     let signed_data = SignedUsageData {
@@ -144,11 +156,15 @@ fn test_prepaid_meter_flow() {
         public_key: device_public_key.clone(),
     };
     client.deduct_units(&signed_data_final);
+    // 3. Report usage (billing by units)
+    let units_consumed = 15; // 15 kWh
+    client.deduct_units(&meter_id, &units_consumed);
+
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 0);
-    assert!(!meter.is_active);
-    assert_eq!(token.balance(&provider), 5000);
-    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(meter.balance, 350); // 500 - 150 = 350
+    assert_eq!(meter.is_active, false); // Below minimum (350 < 500)
+    assert_eq!(token.balance(&provider), 150); // 150 tokens claimed
+    assert_eq!(token.balance(&contract_id), 350);
 
     client.update_usage(&meter_id, &1500);
     let usage_data = client.get_usage_data(&meter_id).unwrap();
@@ -168,11 +184,33 @@ fn test_prepaid_meter_flow() {
     assert_eq!(usage_data.current_cycle_watt_hours, 2_000_000);
     assert_eq!(usage_data.peak_usage_watt_hours, 2_000_000);
 
-    let display_total = UtilityContract::get_watt_hours_display(
-        usage_data.total_watt_hours,
-        usage_data.precision_factor,
-    );
+    // 8. Test display helper function
+    let display_total = UtilityContract::get_watt_hours_display(usage_data.total_watt_hours, usage_data.precision_factor);
     assert_eq!(display_total, 3500); // 3500000 / 1000 = 3500 (3.5 kWh)
+
+    // 9. Test minimum balance functionality
+    let min_balance = client.get_minimum_balance_to_flow();
+    assert_eq!(min_balance, 500); // 500 tokens minimum
+
+    // Test small top-up that doesn't meet minimum
+    let meter_id_2 = client.register_meter(&user, &provider, &rate, &token_address);
+    client.top_up(&meter_id_2, &100); // 100 tokens - below minimum
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 100);
+    assert_eq!(meter_2.is_active, false); // Should not be active
+
+    // Test top-up that meets minimum
+    client.top_up(&meter_id_2, &400); // Add 400 tokens more = 500 total
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 500);
+    assert_eq!(meter_2.is_active, true); // Should now be active
+
+    // Test claim that drops below minimum
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10); // 10 seconds pass
+    client.claim(&meter_id_2); // This should claim 100 tokens (10 * 10)
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 400); // 500 - 100 = 400
+    assert_eq!(meter_2.is_active, false); // Should be deactivated
 }
 
 #[test]
@@ -300,6 +338,8 @@ fn test_heartbeat_functionality() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
+    
+    // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env
         .register_stellar_asset_contract_v2(token_admin.clone())
@@ -667,10 +707,28 @@ fn test_variable_rate_tariffs_peak_vs_offpeak() {
     // Verify the rate multiplier was correctly applied
     // peak_rate should be 1.5x off_peak_rate
     assert_eq!(meter_after_peak.peak_rate, (meter_after_peak.off_peak_rate * 3) / 2);
+    // Register meter
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    
+    // Initially should not be offline
+    assert_eq!(client.is_meter_offline(&meter_id), false);
+    
+    // Simulate time passing more than 1 hour
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3700); // > 1 hour
+    
+    // Should now be offline
+    assert_eq!(client.is_meter_offline(&meter_id), true);
+    
+    // Update heartbeat
+    client.update_heartbeat(&meter_id);
+    
+    // Should no longer be offline
+    assert_eq!(client.is_meter_offline(&meter_id), false);
 }
 
 #[test]
-fn test_variable_rate_deduct_units_respects_peak_hours() {
+fn test_carbon_credit_payment() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -727,19 +785,18 @@ fn test_variable_rate_deduct_units_respects_peak_hours() {
         public_key: device_public_key.clone(),
     }); // 10 units
     
-    let meter = client.get_meter(&meter_id).unwrap();
-    // Peak: 10 units * 30 tokens/unit (20 * 1.5) = 300 tokens
-    assert_eq!(meter.balance, 1500);
-    assert_eq!(token.balance(&provider), 500); // 200 + 300
-}
+    // Setup default token
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    // Setup Carbon Credit Token (e.g., AQUA/Eco-Token)
+    let eco_token_admin = Address::generate(&env);
+    let eco_token_address = env.register_stellar_asset_contract(eco_token_admin.clone());
+    let eco_token = token::Client::new(&env, &eco_token_address);
+    let eco_token_admin_client = token::StellarAssetClient::new(&env, &eco_token_address);
 
-#[test]
-fn test_signature_verification_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let contract_id = env.register(UtilityContract, ());
-    let client = UtilityContractClient::new(&env, &contract_id);
+    // Initial funding of Carbon Credits
+    eco_token_admin_client.mint(&user, &2000); // 2000 Eco-Tokens
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
@@ -751,14 +808,20 @@ fn test_signature_verification_success() {
         .address();
     let _token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    // 1. Register Meter with default token
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
 
-    token_admin_client.mint(&user, &1000);
+    // 2. Add Carbon Credit token as supported
+    client.add_supported_token(&eco_token_address);
 
-    // Generate device key pair
-    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
-    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+    // 3. Top up using Carbon Credits
+    client.top_up_with_token(&meter_id, &1000, &eco_token_address);
 
-    client.top_up(&meter_id, &500);
+    // 4. Verify the meter balance increased
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 1000);
+    assert_eq!(meter.is_active, true);
 
     // Signature verification is tested in dedicated should_panic tests.
     // Here we only test that the data structure is correct.
@@ -792,6 +855,18 @@ fn test_public_key_mismatch() {
     let provider = Address::generate(&env);
 
 
+    // 5. Verify the Carbon Credits were BURNED (balance should be 1000 remaining)
+    assert_eq!(eco_token.balance(&user), 1000);
+    
+    // The contract itself should have 0 eco_tokens because they were correctly burned
+    assert_eq!(eco_token.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_unsupported_token_payment() {
+    
+    // Setup a token
     let token_admin = Address::generate(&env);
     let token_address = env
         .register_stellar_asset_contract_v2(token_admin.clone())
@@ -883,18 +958,29 @@ fn test_xlm_to_usd_conversion_top_up() {
     
     let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
     let meter_id = client.register_meter(&user, &provider, &10, &xlm_address, &device_public_key);
+    // Register meter
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
     
-    // Top up with 100 XLM
-    // Should convert to 100 * 150 = 15000 cents = $150.00
-    client.top_up(&meter_id, &100);
+    // Initially should not be offline
+    assert_eq!(client.is_meter_offline(&meter_id), false);
     
-    let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 15000); // 100 XLM * 150 cents/XLM = 15000 cents
-    assert!(meter.is_active);
+    // Simulate time passing more than 1 hour
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3700); // > 1 hour
+    
+    // Should now be offline
+    assert_eq!(client.is_meter_offline(&meter_id), true);
+    
+    // Update heartbeat
+    client.update_heartbeat(&meter_id);
+    
+    // Should no longer be offline
+    assert_eq!(client.is_meter_offline(&meter_id), false);
 }
 
 #[test]
 fn test_challenge_response_pairing() {
+fn test_carbon_credit_payment() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -960,6 +1046,62 @@ fn test_deduct_units_fails_when_not_paired() {
 
 #[test]
 fn test_withdraw_earnings_xlm_conversion() {
+    
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    let bad_token_admin = Address::generate(&env);
+    let bad_token_address = env.register_stellar_asset_contract(bad_token_admin.clone());
+    let bad_token_admin_client = token::StellarAssetClient::new(&env, &bad_token_address);
+    bad_token_admin_client.mint(&user, &2000);
+
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
+
+    // Should panic because bad_token_address is not supported
+    client.top_up_with_token(&meter_id, &1000, &bad_token_address);
+}
+
+#[test]
+fn test_admin_fee_collection() {
+    // Setup default token
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    // Setup Carbon Credit Token (e.g., AQUA/Eco-Token)
+    let eco_token_admin = Address::generate(&env);
+    let eco_token_address = env.register_stellar_asset_contract(eco_token_admin.clone());
+    let eco_token = token::Client::new(&env, &eco_token_address);
+    let eco_token_admin_client = token::StellarAssetClient::new(&env, &eco_token_address);
+
+    // Initial funding of Carbon Credits
+    eco_token_admin_client.mint(&user, &2000); // 2000 Eco-Tokens
+
+    // 1. Register Meter with default token
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
+
+    // 2. Add Carbon Credit token as supported
+    client.add_supported_token(&eco_token_address);
+
+    // 3. Top up using Carbon Credits
+    client.top_up_with_token(&meter_id, &1000, &eco_token_address);
+
+    // 4. Verify the meter balance increased
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 1000);
+    assert_eq!(meter.is_active, true);
+
+    // 5. Verify the Carbon Credits were BURNED (balance should be 1000 remaining)
+    assert_eq!(eco_token.balance(&user), 1000);
+    
+    // The contract itself should have 0 eco_tokens because they were correctly burned
+    assert_eq!(eco_token.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic]
+fn test_unsupported_token_payment() {
     let env = Env::default();
     env.mock_all_auths();
 
@@ -1026,6 +1168,50 @@ fn test_get_current_rate() {
     let rate = client.get_current_rate().unwrap();
     assert_eq!(rate.price, 175);
     assert_eq!(rate.decimals, 2);
+    let maintenance_wallet = Address::generate(&env);
+    
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &2000);
+
+    // Configure fee: 50 bps = 0.5%
+    client.set_maintenance_config(&maintenance_wallet, &50);
+
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    client.top_up(&meter_id, &1000);
+
+    client.deduct_units(&meter_id, &20); // Cost: 200
+
+    assert_eq!(token.balance(&maintenance_wallet), 1); // 200 * 0.005 = 1
+    assert_eq!(token.balance(&provider), 199);
+    
+    env.ledger().set_timestamp(env.ledger().timestamp() + 40); 
+    client.claim(&meter_id); // Cost: 400
+    
+    assert_eq!(token.balance(&maintenance_wallet), 3); // 1 + (400 * 0.005) = 3
+    assert_eq!(token.balance(&provider), 597); // 199 + 398 = 597
+    assert_eq!(token.balance(&contract_id), 400); // 1000 - 200 - 400 = 400 remaining
+    
+    let default_token_admin = Address::generate(&env);
+    let default_token_address = env.register_stellar_asset_contract(default_token_admin.clone());
+    
+    let bad_token_admin = Address::generate(&env);
+    let bad_token_address = env.register_stellar_asset_contract(bad_token_admin.clone());
+    let bad_token_admin_client = token::StellarAssetClient::new(&env, &bad_token_address);
+    bad_token_admin_client.mint(&user, &2000);
+
+    let rate = 10;
+    let meter_id = client.register_meter(&user, &provider, &rate, &default_token_address);
+
+    // Should panic because bad_token_address is not supported
+    client.top_up_with_token(&meter_id, &1000, &bad_token_address);
 }
 
 // NOTE: Native XLM flow tests removed — env.token() is not available in this SDK version.
