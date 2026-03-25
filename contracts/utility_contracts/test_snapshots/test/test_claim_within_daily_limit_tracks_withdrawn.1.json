@@ -67,6 +67,9 @@
                 },
                 {
                   "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                },
+                {
+                  "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
                 }
               ]
             }
@@ -279,6 +282,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "device_public_key"
+                            },
+                            "val": {
+                              "bytes": "0101010101010101010101010101010101010101010101010101010101010101"
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "heartbeat"
                             },
                             "val": {
@@ -291,6 +302,14 @@
                             },
                             "val": {
                               "bool": true
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_paired"
+                            },
+                            "val": {
+                              "bool": false
                             }
                           },
                           {
@@ -315,6 +334,22 @@
                             },
                             "val": {
                               "i128": "36000"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "off_peak_rate"
+                            },
+                            "val": {
+                              "i128": "10"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "peak_rate"
+                            },
+                            "val": {
+                              "i128": "15"
                             }
                           },
                           {
