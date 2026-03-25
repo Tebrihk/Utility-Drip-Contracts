@@ -43,6 +43,80 @@ impl MockPriceOracleContract {
     }
 }
 
+#[test]
+fn test_provider_total_pool_optimization() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user1 = Address::generate(&env);
+    let user2 = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_address = Address::generate(&env);
+    
+    // Create mock token
+    let token_contract_id = env.register_stellar_asset_contract(user1.clone());
+    let token_client = token::Client::new(&env, &token_contract_id);
+    
+    // Mint tokens for users
+    token_client.mint(&user1, &1000000);
+    token_client.mint(&user2, &1000000);
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    
+    // Register two meters for the same provider
+    let meter1_id = client.register_meter_with_mode(
+        &user1,
+        &provider,
+        &1000, // off_peak_rate
+        &token_contract_id,
+        &BillingType::PrePaid,
+        &device_public_key,
+    );
+    
+    let meter2_id = client.register_meter_with_mode(
+        &user2,
+        &provider,
+        &1000, // off_peak_rate
+        &token_contract_id,
+        &BillingType::PrePaid,
+        &device_public_key,
+    );
+    
+    // Initially, provider total pool should be 0 (no balances yet)
+    let initial_pool = client.get_provider_total_pool(&provider);
+    assert_eq!(initial_pool, 0);
+    
+    // Top up first meter
+    token_client.approve(&user1, &contract_address, &5000);
+    client.top_up(&meter1_id, &5000);
+    
+    // Provider total pool should now be 5000
+    let pool_after_meter1 = client.get_provider_total_pool(&provider);
+    assert_eq!(pool_after_meter1, 5000);
+    
+    // Top up second meter
+    token_client.approve(&user2, &contract_address, &3000);
+    client.top_up(&meter2_id, &3000);
+    
+    // Provider total pool should now be 8000 (5000 + 3000)
+    let pool_after_meter2 = client.get_provider_total_pool(&provider);
+    assert_eq!(pool_after_meter2, 8000);
+    
+    // Simulate some usage/claim from meter1
+    env.ledger().set_timestamp(env.ledger().timestamp() + 3600); // 1 hour later
+    client.claim(&meter1_id);
+    
+    // Pool should be reduced (some balance claimed by provider)
+    let pool_after_claim = client.get_provider_total_pool(&provider);
+    assert!(pool_after_claim < pool_after_meter2);
+    
+    // Verify the function doesn't cause gas issues by calling it multiple times
+    for _ in 0..10 {
+        let _ = client.get_provider_total_pool(&provider);
+    }
+}
+
 struct MockPriceOracle {
     address: Address,
 }

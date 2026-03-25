@@ -108,6 +108,7 @@ pub enum DataKey {
     MaintenanceWallet,
     ProtocolFeeBps,
     SupportedToken(Address),
+    ProviderTotalPool(Address),
 }
 
 #[contracterror]
@@ -329,30 +330,18 @@ fn reset_provider_window_if_needed(window: &mut ProviderWithdrawalWindow, now: u
     }
 }
 
-fn get_provider_total_pool(env: &Env, provider: &Address) -> i128 {
-    let count = env
-        .storage()
+fn get_provider_total_pool_impl(env: &Env, provider: &Address) -> i128 {
+    // Use cached provider total pool to avoid unbounded iteration
+    env.storage()
         .instance()
-        .get::<DataKey, u64>(&DataKey::Count)
-        .unwrap_or(0);
-    let mut total_pool: i128 = 0;
-    let mut meter_id = 1;
+        .get::<DataKey, i128>(&DataKey::ProviderTotalPool(provider.clone()))
+        .unwrap_or(0)
+}
 
-    while meter_id <= count {
-        if let Some(meter) = env
-            .storage()
-            .instance()
-            .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
-        {
-            if meter.provider == *provider {
-                total_pool = total_pool.saturating_add(provider_meter_value(&meter));
-            }
-        }
-
-        meter_id += 1;
-    }
-
-    total_pool
+fn update_provider_total_pool(env: &Env, provider: &Address, old_value: i128, new_value: i128) {
+    let current_pool = get_provider_total_pool_impl(env, provider);
+    let updated_pool = current_pool.saturating_sub(old_value).saturating_add(new_value);
+    env.storage().instance().set(&DataKey::ProviderTotalPool(provider.clone()), &updated_pool);
 }
 
 fn apply_provider_withdrawal_limit(
@@ -506,6 +495,11 @@ impl UtilityContract {
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
         env.storage().instance().set(&DataKey::Count, &count);
+        
+        // Initialize provider total pool (new meter starts with 0 value)
+        let current_pool = get_provider_total_pool_impl(&env, &provider);
+        env.storage().instance().set(&DataKey::ProviderTotalPool(provider), &current_pool);
+        
         count
     }
 
@@ -514,6 +508,7 @@ impl UtilityContract {
         meter.user.require_auth();
 
         let was_active = meter.is_active;
+        let old_meter_value = provider_meter_value(&meter);
         // Transfer tokens from user to contract
         let token_client = token::Client::new(&env, &meter.token);
         token_client.transfer(&meter.user, &env.current_contract_address(), &amount);
@@ -548,6 +543,10 @@ impl UtilityContract {
             meter.last_update = now;
             publish_active_event(&env, meter_id, now);
         }
+        
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
         
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
         
@@ -628,6 +627,9 @@ impl UtilityContract {
 
         // Verify the signature and pairing
         verify_usage_signature(&env, &signed_data, &meter)?;
+        
+        // Store old meter value for pool update
+        let old_meter_value = provider_meter_value(&meter);
 
         if !meter.is_paired {
             panic_with_error!(&env, ContractError::MeterNotPaired);
@@ -669,6 +671,11 @@ impl UtilityContract {
         }
 
         meter.last_update = now;
+        
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
+        
         env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
 
         // Emit UsageReported event
@@ -681,6 +688,9 @@ impl UtilityContract {
     pub fn claim(env: Env, meter_id: u64) {
         let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
         meter.provider.require_auth();
+
+        // Store old meter value for pool update
+        let old_meter_value = provider_meter_value(&meter);
 
         let now = env.ledger().timestamp();
         let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
@@ -762,6 +772,10 @@ impl UtilityContract {
         if meter.balance < MINIMUM_BALANCE_TO_FLOW {
             meter.is_active = false;
         }
+
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
 
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
@@ -880,6 +894,9 @@ impl UtilityContract {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         
+        // Store old meter value for pool update
+        let old_meter_value = provider_meter_value(&meter);
+        
         let available_earnings = match meter.billing_type {
             BillingType::PrePaid => meter.balance,
             BillingType::PostPaid => meter.debt,
@@ -916,6 +933,10 @@ impl UtilityContract {
             meter.last_update = now;
         }
         
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
+        
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
         
         // Emit conversion event if XLM was used
@@ -935,6 +956,10 @@ impl UtilityContract {
             }
             None => None,
         }
+    }
+
+    pub fn get_provider_total_pool(env: Env, provider: Address) -> i128 {
+        get_provider_total_pool_impl(&env, &provider)
     }
 
     pub fn is_meter_offline(env: Env, meter_id: u64) -> bool {
@@ -965,7 +990,12 @@ impl UtilityContract {
         new_user.require_auth();
 
         let old_user = meter.user.clone();
+        let old_meter_value = provider_meter_value(&meter);
         meter.user = new_user.clone();
+
+        // Update provider total pool (provider stays the same, only user changes)
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
 
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
 
