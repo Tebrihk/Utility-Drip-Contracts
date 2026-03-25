@@ -199,7 +199,35 @@
                           },
                           {
                             "key": {
+                              "symbol": "billing_type"
+                            },
+                            "val": {
+                              "vec": [
+                                {
+                                  "symbol": "PrePaid"
+                                }
+                              ]
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "claimed_this_hour"
+                            },
+                            "val": {
+                              "i128": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "collateral_limit"
+                            },
+                            "val": {
+                              "i128": "0"
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "debt"
                             },
                             "val": {
                               "i128": "0"
