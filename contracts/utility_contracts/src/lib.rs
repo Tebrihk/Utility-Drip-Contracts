@@ -1,36 +1,8 @@
 #![no_std]
+use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Symbol};
 
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Env, BytesN, Vec,
-    Address, Env, Symbol,
-};
-
-// Oracle client interface
-use soroban_sdk::contractclient;
-
-#[contractclient(name = "PriceOracleClient")]
-pub trait PriceOracle {
-    fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
-    fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
-    fn get_price(env: Env) -> PriceData;
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct PriceData {
-    pub price: i128,
-    pub decimals: u32,
-    pub last_updated: u64,
-}
-mod fuzz_tests;
-
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum BillingType {
-    PrePaid,
-    PostPaid,
-}
+// Minimum balance required to keep the IoT relay open (500 tokens for testing)
+const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
 
 #[contracttype]
 #[derive(Clone)]
@@ -402,8 +374,14 @@ fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
 
 #[contractimpl]
 impl UtilityContract {
-    pub fn set_oracle(env: Env, oracle: Address) {
-        env.storage().instance().set(&DataKey::Oracle, &oracle);
+    pub fn get_minimum_balance_to_flow() -> i128 {
+        MINIMUM_BALANCE_TO_FLOW
+    }
+
+    pub fn set_oracle(env: Env, oracle_address: Address) {
+        // This should be called by admin to set the oracle address
+        // For now, we'll just store it in instance storage
+        env.storage().instance().set(&DataKey::Oracle, &oracle_address);
     }
 
     pub fn register_meter(
@@ -494,78 +472,11 @@ impl UtilityContract {
         
         client.transfer(&meter.user, &env.current_contract_address(), &amount);
 
-        match meter.billing_type {
-            BillingType::PrePaid => {
-                meter.balance = meter.balance.saturating_add(converted_amount);
-            }
-            BillingType::PostPaid => {
-                let settlement = converted_amount.min(meter.debt.max(0));
-                meter.debt = meter.debt.saturating_sub(settlement);
-                meter.collateral_limit = meter
-                    .collateral_limit
-                    .saturating_add(converted_amount.saturating_sub(settlement));
-            }
-        }
-
-        let now = env.ledger().timestamp();
-        refresh_activity(&mut meter);
-        if !was_active && meter.is_active {
-            meter.last_update = now;
-        }
-
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        if !was_active && meter.is_active {
-            publish_active_event(&env, meter_id, now);
-        }
+        meter.balance += amount;
+        meter.is_active = true;
+        meter.last_update = env.ledger().timestamp();
         
-        // Emit conversion event if XLM was used
-        if !meter.token.to_string().starts_with("CA") {
-            env.events().publish(
-                (symbol_short!("XLMtoUSD"), meter_id), 
-                (amount, converted_amount)
-            );
-        }
-    }
-
-    pub fn claim(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        let now = env.ledger().timestamp();
-        if !meter.is_active {
-            meter.last_update = now;
-            env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-            return;
-        }
-
-        reset_claim_window_if_needed(&mut meter, now);
-
-        let elapsed = now.saturating_sub(meter.last_update);
-        let effective_rate = get_effective_rate(&meter, now);
-        let requested = (elapsed as i128).saturating_mul(effective_rate);
-        let claimable = requested
-            .min(remaining_claim_capacity(&meter))
-            .min(provider_meter_value(&meter));
-
-        if claimable > 0 {
-            let provider_window =
-                apply_provider_withdrawal_limit(&env, &meter.provider, claimable);
-            apply_provider_claim(&env, &mut meter, claimable);
-            env.storage().instance().set(
-                &DataKey::ProviderWindow(meter.provider.clone()),
-                &provider_window,
-            );
-        }
-
-        let was_active = meter.is_active;
-        meter.last_update = now;
-        refresh_activity(&mut meter);
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-
-        if was_active && !meter.is_active {
-            publish_inactive_event(&env, meter_id, now);
-        }
     }
 
     pub fn update_device_public_key(env: Env, meter_id: u64, new_public_key: BytesN<32>) {
@@ -614,19 +525,31 @@ impl UtilityContract {
 
         env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
 
-        if was_active && !meter.is_active {
-            publish_inactive_event(&env, signed_data.meter_id, now);
+            if actual_claim > 0 {
+                let client = token::Client::new(&env, &meter.token);
+                client.transfer(&env.current_contract_address(), &meter.provider, &actual_claim);
+                meter.balance -= actual_claim;
+            }
+        }
+        
+        // Check minimum balance after deduction
+        if meter.balance < MINIMUM_BALANCE_TO_FLOW {
+            meter.is_active = false;
         }
 
-        env.events()
-            .publish((symbol_short!("Usage"), signed_data.meter_id), (signed_data.units_consumed, claimable));
-    }
+        
+        // Deactivate if balance falls below minimum requirement
+        if meter.balance < MINIMUM_BALANCE_TO_FLOW {
+            meter.is_active = false;
+        }
 
-    pub fn set_max_flow_rate(env: Env, meter_id: u64, max_flow_rate_per_hour: i128) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-        meter.max_flow_rate_per_hour = max_flow_rate_per_hour.max(0);
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        // Emit UsageReported event
+        env.events().publish(
+            (Symbol::new(&env, "UsageReported"), meter_id),
+            (units_consumed, cost)
+        );
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
@@ -695,31 +618,47 @@ impl UtilityContract {
         precise_watt_hours / precision_factor
     }
 
+    }
+
     pub fn calculate_expected_depletion(env: Env, meter_id: u64) -> Option<u64> {
-        env.storage()
-            .instance()
-            .get::<DataKey, Meter>(&DataKey::Meter(meter_id))
-            .map(|meter| {
-                if meter.off_peak_rate <= 0 {
-                if meter.rate_per_unit <= 0 {
-                    return 0;
-                }
-
-                let available = provider_meter_value(&meter);
-                if available <= 0 {
-                    return 0;
-                }
-
-                env.ledger().timestamp() + (available / meter.off_peak_rate) as u64
-                env.ledger().timestamp()
-                    + (available / meter.rate_per_unit) as u64
-            })
+        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
+            if meter.balance <= 0 || meter.rate_per_unit <= 0 {
+                return Some(0); // Already depleted or no consumption
+            }
+            
+            let seconds_until_depletion = meter.balance / meter.rate_per_unit;
+            let current_time = env.ledger().timestamp();
+            Some(current_time + seconds_until_depletion as u64)
+        } else {
+            None
+        }
     }
 
     pub fn emergency_shutdown(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
+        
+        // Emergency shutdown always disables the meter regardless of balance
         meter.is_active = false;
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn set_max_flow_rate(env: Env, meter_id: u64, max_rate_per_hour: i128) {
+        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        meter.provider.require_auth();
+        
+        meter.max_flow_rate_per_hour = max_rate_per_hour;
+        
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    pub fn set_max_flow_rate(env: Env, meter_id: u64, max_rate_per_hour: i128) {
+        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        meter.provider.require_auth();
+        
+        // Emergency shutdown always disables the meter regardless of balance
+        meter.is_active = false;
+        
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
     }
 

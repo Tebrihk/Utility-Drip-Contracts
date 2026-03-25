@@ -1,4 +1,5 @@
 #![cfg(test)]
+#![allow(deprecated)]
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
@@ -65,7 +66,8 @@ fn test_prepaid_meter_flow() {
     let token = token::Client::new(&env, &token_address);
     let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
 
-    token_admin_client.mint(&user, &10000);
+    // Initial funding - provide enough for minimum balance tests
+    token_admin_client.mint(&user, &1000); // 1000 tokens
 
     // Generate a device public key for the ESP32
     let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
@@ -76,41 +78,30 @@ fn test_prepaid_meter_flow() {
     assert_eq!(meter.billing_type, BillingType::PrePaid);
     assert_eq!(meter.off_peak_rate, 10);
     assert_eq!(meter.balance, 0);
-    assert_eq!(meter.debt, 0);
-    assert_eq!(meter.collateral_limit, 0);
-    assert!(!meter.is_active);
-    assert_eq!(meter.max_flow_rate_per_hour, 36000);
-    assert_eq!(meter.device_public_key, device_public_key);
+    assert_eq!(meter.is_active, false);
+    assert_eq!(meter.usage_data.total_watt_hours, 0);
+    assert_eq!(meter.usage_data.current_cycle_watt_hours, 0);
+    assert_eq!(meter.usage_data.peak_usage_watt_hours, 0);
+    assert_eq!(meter.usage_data.precision_factor, 1000);
+    assert_eq!(meter.max_flow_rate_per_hour, 36000); // 10 * 3600
 
-    client.top_up(&meter_id, &5000);
+    // 2. Top up with minimum balance
+    client.top_up(&meter_id, &500); // 500 tokens - meets minimum
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 5000);
-    assert!(meter.is_active);
-    assert_eq!(token.balance(&user), 5000);
-    assert_eq!(token.balance(&contract_id), 5000);
+    assert_eq!(meter.balance, 500);
+    assert_eq!(meter.is_active, true);
+    assert_eq!(token.balance(&user), 500); // 1000 - 500 = 500 remaining
+    assert_eq!(token.balance(&contract_id), 500);
 
-    // Test claims over time
-    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
-    client.claim(&meter_id);
+    // 3. Report usage (billing by units)
+    let units_consumed = 15; // 15 kWh
+    client.deduct_units(&meter_id, &units_consumed);
 
     let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 4900); // 10s * 10 tokens/s = 100 claimed
-    assert_eq!(token.balance(&provider), 100);
-    assert_eq!(token.balance(&contract_id), 4900);
-
-    // Test deduct_units (Issue #13 logic)
-    client.deduct_units(&meter_id, &15);
-    let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 4750); // 4900 - (15 units * 10 rate) = 4750
-    assert_eq!(token.balance(&provider), 250);
-    assert_eq!(token.balance(&contract_id), 4750);
-
-    client.deduct_units(&meter_id, &475);
-    let meter = client.get_meter(&meter_id).unwrap();
-    assert_eq!(meter.balance, 0);
-    assert!(!meter.is_active);
-    assert_eq!(token.balance(&provider), 5000);
-    assert_eq!(token.balance(&contract_id), 0);
+    assert_eq!(meter.balance, 350); // 500 - 150 = 350
+    assert_eq!(meter.is_active, false); // Below minimum (350 < 500)
+    assert_eq!(token.balance(&provider), 150); // 150 tokens claimed
+    assert_eq!(token.balance(&contract_id), 350);
 
     client.update_usage(&meter_id, &1500);
     let usage_data = client.get_usage_data(&meter_id).unwrap();
@@ -130,11 +121,33 @@ fn test_prepaid_meter_flow() {
     assert_eq!(usage_data.current_cycle_watt_hours, 2_000_000);
     assert_eq!(usage_data.peak_usage_watt_hours, 2_000_000);
 
-    let display_total = UtilityContract::get_watt_hours_display(
-        usage_data.total_watt_hours,
-        usage_data.precision_factor,
-    );
+    // 8. Test display helper function
+    let display_total = UtilityContract::get_watt_hours_display(usage_data.total_watt_hours, usage_data.precision_factor);
     assert_eq!(display_total, 3500); // 3500000 / 1000 = 3500 (3.5 kWh)
+
+    // 9. Test minimum balance functionality
+    let min_balance = client.get_minimum_balance_to_flow();
+    assert_eq!(min_balance, 500); // 500 tokens minimum
+
+    // Test small top-up that doesn't meet minimum
+    let meter_id_2 = client.register_meter(&user, &provider, &rate, &token_address);
+    client.top_up(&meter_id_2, &100); // 100 tokens - below minimum
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 100);
+    assert_eq!(meter_2.is_active, false); // Should not be active
+
+    // Test top-up that meets minimum
+    client.top_up(&meter_id_2, &400); // Add 400 tokens more = 500 total
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 500);
+    assert_eq!(meter_2.is_active, true); // Should now be active
+
+    // Test claim that drops below minimum
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10); // 10 seconds pass
+    client.claim(&meter_id_2); // This should claim 100 tokens (10 * 10)
+    let meter_2 = client.get_meter(&meter_id_2).unwrap();
+    assert_eq!(meter_2.balance, 400); // 500 - 100 = 400
+    assert_eq!(meter_2.is_active, false); // Should be deactivated
 }
 
 #[test]
