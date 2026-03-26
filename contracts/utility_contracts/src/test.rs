@@ -394,6 +394,157 @@ fn test_xlm_precision_rounding_edge_cases() {
 }
 
 #[test]
+fn test_grace_period_expiration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+    
+    // Top up with minimum balance to activate
+    client.top_up(&meter_id, &500);
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert!(meter.is_active);
+    assert_eq!(meter.balance, 500);
+    assert_eq!(meter.grace_period_start, 0);
+
+    // Pair the meter
+    client.initiate_pairing(&meter_id);
+    client.complete_pairing(&meter_id, &BytesN::from_array(&env, &[2u8; 64]));
+
+    // Use up balance exactly to 0 - should start grace period
+    env.ledger().set_timestamp(env.ledger().timestamp() + 50); // 50 seconds * 10 rate = 500
+    client.claim(&meter_id);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 0);
+    assert!(meter.is_active); // Should still be active due to grace period
+    assert!(meter.grace_period_start > 0); // Grace period should have started
+
+    // Use some more to go into debt (but above threshold)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10); // 10 seconds * 10 rate = 100
+    client.claim(&meter_id);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, -100);
+    assert!(meter.is_active); // Should still be active during grace period
+
+    // Fast forward 23 hours - should still be active
+    env.ledger().set_timestamp(env.ledger().timestamp() + (23 * 60 * 60));
+    client.claim(&meter_id); // This will trigger grace period check
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert!(meter.is_active); // Should still be active (less than 24 hours)
+
+    // Fast forward another 2 hours (total 25 hours) - should expire grace period
+    env.ledger().set_timestamp(env.ledger().timestamp() + (2 * 60 * 60));
+    client.claim(&meter_id); // This will trigger grace period check
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert!(!meter.is_active); // Should be inactive (grace period expired)
+    assert!(meter.balance < 0); // Should still be in debt
+}
+
+#[test]
+fn test_grace_period_debt_threshold() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    // Mint enough to test debt threshold
+    token_admin_client.mint(&user, &20_000_000); // 2 XLM
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1_000_000, &token_address, &device_public_key); // High rate
+    
+    // Top up with small amount
+    client.top_up(&meter_id, &1_000_000);
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert!(meter.is_active);
+
+    // Pair the meter
+    client.initiate_pairing(&meter_id);
+    client.complete_pairing(&meter_id, &BytesN::from_array(&env, &[2u8; 64]));
+
+    // Try to claim beyond debt threshold (-10 XLM = -10,000,000 stroops)
+    env.ledger().set_timestamp(env.ledger().timestamp() + 15); // 15 seconds * 1,000,000 rate = 15,000,000
+    client.claim(&meter_id);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, -10_000_000); // Should stop at debt threshold
+    assert!(meter.is_active); // Should be in grace period
+
+    // Try to claim more - should be blocked by threshold
+    env.ledger().set_timestamp(env.ledger().timestamp() + 1);
+    client.claim(&meter_id);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, -10_000_000); // Should not go below threshold
+}
+
+#[test]
+fn test_auto_debt_settlement_on_top_up() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &2000);
+
+    let device_public_key = BytesN::from_array(&env, &[1u8; 32]);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_public_key);
+    
+    // Top up and use up balance to go into debt
+    client.top_up(&meter_id, &1000);
+    env.ledger().set_timestamp(env.ledger().timestamp() + 150); // 150 seconds * 10 rate = 1500
+    client.claim(&meter_id);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, -500);
+    assert!(meter.is_active); // Should be in grace period
+
+    // Top up - should auto-settle debt first
+    client.top_up(&meter_id, &800);
+    
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 300); // 800 - 500 debt settlement = 300 remaining
+    assert!(meter.is_active); // Should be active with positive balance
+    assert_eq!(meter.grace_period_start, 0); // Grace period should be reset
+}
+
+#[test]
 fn test_peak_hour_tariff() {
     let env = Env::default();
     env.mock_all_auths();
@@ -403,7 +554,6 @@ fn test_peak_hour_tariff() {
 
     let user = Address::generate(&env);
     let provider = Address::generate(&env);
-
 
     // Setup a token
     let token_admin = Address::generate(&env);

@@ -1,11 +1,11 @@
 #![no_std]
-use soroban_sdk::{contract, contracttype, contractimpl, Address, Env, token, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol};
 
+use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
     Address, Bytes, BytesN, Env, Symbol, Vec,
 };
-use soroban_sdk::xdr::ToXdr;
 
 // Oracle client interface
 use soroban_sdk::contractclient;
@@ -72,8 +72,8 @@ pub struct Meter {
     pub user: Address,
     pub provider: Address,
     pub billing_type: BillingType,
-    pub off_peak_rate: i128,      // rate per second during off-peak hours
-    pub peak_rate: i128,          // rate per second during peak hours (1.5x off-peak)
+    pub off_peak_rate: i128, // rate per second during off-peak hours
+    pub peak_rate: i128,     // rate per second during peak hours (1.5x off-peak)
     pub rate_per_second: i128,
     pub rate_per_unit: i128,
     pub balance: i128,
@@ -89,6 +89,7 @@ pub struct Meter {
     pub heartbeat: u64,
     pub device_public_key: BytesN<32>,
     pub is_paired: bool,
+    pub grace_period_start: u64, // timestamp when balance hit 0 and grace period started
 }
 
 #[contracttype]
@@ -145,6 +146,8 @@ pub struct UtilityContract;
 
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
+const GRACE_PERIOD_SECONDS: u64 = 86_400; // 24 hours grace period
+const DEBT_THRESHOLD: i128 = -10_000_000; // -10 XLM (in stroops) threshold for negative balance
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
 const MAX_USAGE_PER_UPDATE: i128 = 1_000_000_000_000i128; // 1 billion kWh max per update
 const MIN_PRECISION_FACTOR: i128 = 1;
@@ -152,7 +155,7 @@ const MAX_TIMESTAMP_DELAY: u64 = 300; // 5 minutes
 
 // Peak hours: 18:00 - 21:00 UTC
 const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
-const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS;   // 75600 seconds
+const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS; // 75600 seconds
 const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
 const RATE_PRECISION: i128 = 2; // Precision for rate calculations
 
@@ -177,10 +180,10 @@ fn convert_usd_cents_to_xlm_with_rounding(usd_cents: i128, xlm_price_cents: i128
     if xlm_price_cents <= 0 {
         return 0;
     }
-    
+
     // Calculate raw XLM amount with higher precision
     let raw_xlm = usd_cents.saturating_mul(XLM_PRECISION) / xlm_price_cents;
-    
+
     // Round to nearest minimum increment to prevent value loss
     round_xlm_to_minimum_increment(raw_xlm)
 }
@@ -190,15 +193,15 @@ fn convert_xlm_to_usd_cents_with_rounding(xlm_amount: i128, xlm_price_cents: i12
     if xlm_price_cents <= 0 {
         return 0;
     }
-    
+
     // Calculate USD cents, rounding to nearest cent
     let raw_usd = xlm_amount.saturating_mul(xlm_price_cents) / XLM_PRECISION;
-    
+
     // Round to nearest cent
     if raw_usd >= 0 {
-        ((raw_usd + 50) / 100) * 100  // Round up on .5 or higher
+        ((raw_usd + 50) / 100) * 100 // Round up on .5 or higher
     } else {
-        ((raw_usd - 50) / 100) * 100  // Round down on -.5 or lower
+        ((raw_usd - 50) / 100) * 100 // Round down on -.5 or lower
     }
 }
 
@@ -209,7 +212,13 @@ fn is_native_token(_token_address: &Address) -> bool {
 }
 
 /// Transfer tokens, handling both native XLM and SAC tokens
-fn transfer_tokens(env: &Env, token_address: &Address, from: &Address, to: &Address, amount: &i128) {
+fn transfer_tokens(
+    env: &Env,
+    token_address: &Address,
+    from: &Address,
+    to: &Address,
+    amount: &i128,
+) {
     let client = token::Client::new(env, token_address);
     client.transfer(from, to, amount);
 }
@@ -242,9 +251,17 @@ fn get_oracle_or_panic(env: &Env) -> Address {
     }
 }
 
-fn convert_xlm_to_usd_if_needed(env: &Env, amount: i128, _token: &Address) -> Result<i128, ContractError> {
+fn convert_xlm_to_usd_if_needed(
+    env: &Env,
+    amount: i128,
+    _token: &Address,
+) -> Result<i128, ContractError> {
     // If an oracle is set, convert with proper rounding. Otherwise pass through as-is.
-    match env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Oracle)
+    {
         Some(oracle_address) => {
             let oracle_client = PriceOracleClient::new(env, &oracle_address);
             let price_data = oracle_client.get_price();
@@ -255,8 +272,16 @@ fn convert_xlm_to_usd_if_needed(env: &Env, amount: i128, _token: &Address) -> Re
     }
 }
 
-fn convert_usd_to_xlm_if_needed(env: &Env, usd_cents: i128, _token: &Address) -> Result<i128, ContractError> {
-    match env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+fn convert_usd_to_xlm_if_needed(
+    env: &Env,
+    usd_cents: i128,
+    _token: &Address,
+) -> Result<i128, ContractError> {
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Oracle)
+    {
         Some(oracle_address) => {
             let oracle_client = PriceOracleClient::new(env, &oracle_address);
             let price_data = oracle_client.get_price();
@@ -291,8 +316,33 @@ fn provider_meter_value(meter: &Meter) -> i128 {
     }
 }
 
-fn refresh_activity(meter: &mut Meter) {
-    meter.is_active = provider_meter_value(meter) > 0;
+fn refresh_activity(meter: &mut Meter, now: u64) {
+    match meter.billing_type {
+        BillingType::PrePaid => {
+            // Check if meter is in grace period
+            if meter.balance <= 0 && meter.grace_period_start == 0 {
+                // Balance just hit 0, start grace period
+                meter.grace_period_start = now;
+                meter.is_active = true; // Keep active during grace period
+            } else if meter.balance < 0 && meter.grace_period_start > 0 {
+                // Check if grace period has expired
+                if now.saturating_sub(meter.grace_period_start) >= GRACE_PERIOD_SECONDS {
+                    meter.is_active = false;
+                } else {
+                    meter.is_active = true; // Still in grace period
+                }
+            } else if meter.balance > 0 {
+                // Reset grace period when balance is positive again
+                meter.grace_period_start = 0;
+                meter.is_active = meter.balance >= MINIMUM_BALANCE_TO_FLOW;
+            } else {
+                meter.is_active = meter.balance >= MINIMUM_BALANCE_TO_FLOW;
+            }
+        }
+        BillingType::PostPaid => {
+            meter.is_active = remaining_postpaid_collateral(meter) > 0;
+        }
+    }
 }
 
 fn reset_claim_window_if_needed(meter: &mut Meter, now: u64) {
@@ -340,8 +390,12 @@ fn get_provider_total_pool_impl(env: &Env, provider: &Address) -> i128 {
 
 fn update_provider_total_pool(env: &Env, provider: &Address, old_value: i128, new_value: i128) {
     let current_pool = get_provider_total_pool_impl(env, provider);
-    let updated_pool = current_pool.saturating_sub(old_value).saturating_add(new_value);
-    env.storage().instance().set(&DataKey::ProviderTotalPool(provider.clone()), &updated_pool);
+    let updated_pool = current_pool
+        .saturating_sub(old_value)
+        .saturating_add(new_value);
+    env.storage()
+        .instance()
+        .set(&DataKey::ProviderTotalPool(provider.clone()), &updated_pool);
 }
 
 fn apply_provider_withdrawal_limit(
@@ -374,7 +428,13 @@ fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
         return;
     }
 
-    transfer_tokens(env, &meter.token, &env.current_contract_address(), &meter.provider, &amount);
+    transfer_tokens(
+        env,
+        &meter.token,
+        &env.current_contract_address(),
+        &meter.provider,
+        &amount,
+    );
 
     match meter.billing_type {
         BillingType::PrePaid => {
@@ -406,20 +466,30 @@ impl UtilityContract {
 
     pub fn set_oracle(env: Env, oracle_address: Address) {
         // This should be called by admin to set the oracle address
-        env.storage().instance().set(&DataKey::Oracle, &oracle_address);
+        env.storage()
+            .instance()
+            .set(&DataKey::Oracle, &oracle_address);
     }
 
     pub fn set_maintenance_config(env: Env, wallet: Address, fee_bps: i128) {
-        env.storage().instance().set(&DataKey::MaintenanceWallet, &wallet);
-        env.storage().instance().set(&DataKey::ProtocolFeeBps, &fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceWallet, &wallet);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeBps, &fee_bps);
     }
 
     pub fn add_supported_token(env: Env, token: Address) {
-        env.storage().instance().set(&DataKey::SupportedToken(token), &true);
+        env.storage()
+            .instance()
+            .set(&DataKey::SupportedToken(token), &true);
     }
 
     pub fn remove_supported_token(env: Env, token: Address) {
-        env.storage().instance().set(&DataKey::SupportedToken(token), &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::SupportedToken(token), &false);
     }
 
     pub fn register_meter(
@@ -461,7 +531,7 @@ impl UtilityContract {
 
         let now = env.ledger().timestamp();
         let peak_rate = off_peak_rate.saturating_mul(PEAK_RATE_MULTIPLIER) / RATE_PRECISION;
-        
+
         let usage_data = UsageData {
             total_watt_hours: 0,
             current_cycle_watt_hours: 0,
@@ -491,15 +561,18 @@ impl UtilityContract {
             heartbeat: now,
             device_public_key,
             is_paired: false,
+            grace_period_start: 0,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
         env.storage().instance().set(&DataKey::Count, &count);
-        
+
         // Initialize provider total pool (new meter starts with 0 value)
         let current_pool = get_provider_total_pool_impl(&env, &provider);
-        env.storage().instance().set(&DataKey::ProviderTotalPool(provider), &current_pool);
-        
+        env.storage()
+            .instance()
+            .set(&DataKey::ProviderTotalPool(provider), &current_pool);
+
         count
     }
 
@@ -512,20 +585,28 @@ impl UtilityContract {
         // Transfer tokens from user to contract
         let token_client = token::Client::new(&env, &meter.token);
         token_client.transfer(&meter.user, &env.current_contract_address(), &amount);
-        
+
         // Convert XLM to USD cents if needed
         let converted_amount = match convert_xlm_to_usd_if_needed(&env, amount, &meter.token) {
             Ok(amount) => amount,
             Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
         };
-        
+
         if converted_amount <= 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
 
         match meter.billing_type {
             BillingType::PrePaid => {
-                meter.balance = meter.balance.saturating_add(converted_amount);
+                // Auto-deduct debt first if in debt mode
+                if meter.balance < 0 {
+                    let debt_settlement = converted_amount.min(meter.balance.abs());
+                    meter.balance = meter.balance.saturating_add(debt_settlement);
+                    let remaining_amount = converted_amount.saturating_sub(debt_settlement);
+                    meter.balance = meter.balance.saturating_add(remaining_amount);
+                } else {
+                    meter.balance = meter.balance.saturating_add(converted_amount);
+                }
             }
             BillingType::PostPaid => {
                 let settlement = converted_amount.min(meter.debt.max(0));
@@ -537,23 +618,25 @@ impl UtilityContract {
         }
 
         let now = env.ledger().timestamp();
-        refresh_activity(&mut meter);
-        
+        refresh_activity(&mut meter, now);
+
         if !was_active && meter.is_active {
             meter.last_update = now;
             publish_active_event(&env, meter_id, now);
         }
-        
+
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
+
         // Emit conversion event
         env.events().publish(
-            (symbol_short!("TokenUp"), meter_id), 
-            (amount, converted_amount)
+            (symbol_short!("TokenUp"), meter_id),
+            (amount, converted_amount),
         );
     }
 
@@ -615,7 +698,9 @@ impl UtilityContract {
             .remove::<DataKey, BytesN<32>>(&DataKey::PairingChallenge(meter_id));
 
         meter.is_paired = true;
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
 
         env.events()
             .publish((symbol_short!("PairComplete"), meter_id), signature);
@@ -627,7 +712,7 @@ impl UtilityContract {
 
         // Verify the signature and pairing
         verify_usage_signature(&env, &signed_data, &meter)?;
-        
+
         // Store old meter value for pool update
         let old_meter_value = provider_meter_value(&meter);
 
@@ -665,28 +750,33 @@ impl UtilityContract {
             meter.usage_data.peak_usage_watt_hours = meter.usage_data.current_cycle_watt_hours;
         }
 
-        // Check minimum balance after deduction
-        if meter.balance < MINIMUM_BALANCE_TO_FLOW {
-            meter.is_active = false;
-        }
+        // Update activity status with grace period logic
+        refresh_activity(&mut meter, now);
 
         meter.last_update = now;
-        
+
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-        
-        env.storage().instance().set(&DataKey::Meter(signed_data.meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(signed_data.meter_id), &meter);
 
         // Emit UsageReported event
         env.events().publish(
             (Symbol::new(&env, "UsageReported"), signed_data.meter_id),
-            (signed_data.units_consumed, cost)
+            (signed_data.units_consumed, cost),
         );
     }
 
     pub fn claim(env: Env, meter_id: u64) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.provider.require_auth();
 
         // Store old meter value for pool update
@@ -695,11 +785,11 @@ impl UtilityContract {
         let now = env.ledger().timestamp();
         let elapsed = now.checked_sub(meter.last_update).unwrap_or(0);
         let amount = (elapsed as i128) * meter.rate_per_unit;
-        
+
         // Check if we're in the same hour as last claim
         let current_hour = now / 3600;
         let last_claim_hour = meter.last_claim_time / 3600;
-        
+
         if current_hour == last_claim_hour {
             // Same hour, check if we exceed max flow rate
             let max_allowed = meter.max_flow_rate_per_hour - meter.claimed_this_hour;
@@ -708,10 +798,14 @@ impl UtilityContract {
             } else {
                 amount
             };
-            
-            // Ensure we don't overdraw the balance
-            let claimable = if actual_amount > meter.balance {
-                meter.balance
+
+            // Ensure we don't exceed debt threshold
+            let claimable = if actual_amount > meter.balance
+                && meter.balance - actual_amount >= DEBT_THRESHOLD
+            {
+                actual_amount
+            } else if actual_amount > meter.balance {
+                meter.balance - DEBT_THRESHOLD // Allow going down to threshold
             } else {
                 actual_amount
             };
@@ -719,9 +813,17 @@ impl UtilityContract {
             if claimable > 0 {
                 let client = token::Client::new(&env, &meter.token);
                 let mut payout = claimable;
-                
-                if let Some(wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
-                    let fee_bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ProtocolFeeBps)
+                        .unwrap_or(0);
                     let fee = (claimable * fee_bps) / 10000;
                     payout -= fee;
                     if fee > 0 {
@@ -737,10 +839,12 @@ impl UtilityContract {
         } else {
             // New hour, reset claimed_this_hour
             meter.claimed_this_hour = 0;
-            
-            // Ensure we don't overdraw the balance
-            let claimable = if amount > meter.balance {
-                meter.balance
+
+            // Ensure we don't exceed debt threshold
+            let claimable = if amount > meter.balance && meter.balance - amount >= DEBT_THRESHOLD {
+                amount
+            } else if amount > meter.balance {
+                meter.balance - DEBT_THRESHOLD // Allow going down to threshold
             } else {
                 amount
             };
@@ -748,9 +852,17 @@ impl UtilityContract {
             if claimable > 0 {
                 let client = token::Client::new(&env, &meter.token);
                 let mut payout = claimable;
-                
-                if let Some(wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
-                    let fee_bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps: i128 = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ProtocolFeeBps)
+                        .unwrap_or(0);
                     let fee = (claimable * fee_bps) / 10000;
                     payout -= fee;
                     if fee > 0 {
@@ -767,17 +879,17 @@ impl UtilityContract {
 
         meter.last_update = now;
         meter.last_claim_time = now;
-        
-        // Deactivate if balance falls below minimum requirement
-        if meter.balance < MINIMUM_BALANCE_TO_FLOW {
-            meter.is_active = false;
-        }
+
+        // Update activity status with grace period logic
+        refresh_activity(&mut meter, now);
 
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn update_usage(env: Env, meter_id: u64, watt_hours_consumed: i128) {
@@ -785,11 +897,11 @@ impl UtilityContract {
         if watt_hours_consumed < 0 {
             panic_with_error!(env, ContractError::InvalidUsageValue);
         }
-        
+
         if watt_hours_consumed > MAX_USAGE_PER_UPDATE {
             panic_with_error!(env, ContractError::UsageExceedsLimit);
         }
-        
+
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
@@ -809,7 +921,9 @@ impl UtilityContract {
         }
 
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn reset_cycle_usage(env: Env, meter_id: u64) {
@@ -817,7 +931,9 @@ impl UtilityContract {
         meter.provider.require_auth();
         meter.usage_data.current_cycle_watt_hours = 0;
         meter.usage_data.last_reading_timestamp = env.ledger().timestamp();
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn get_usage_data(env: Env, meter_id: u64) -> Option<UsageData> {
@@ -847,11 +963,15 @@ impl UtilityContract {
     }
 
     pub fn calculate_expected_depletion(env: Env, meter_id: u64) -> Option<u64> {
-        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
+        if let Some(meter) = env
+            .storage()
+            .instance()
+            .get::<_, Meter>(&DataKey::Meter(meter_id))
+        {
             if meter.balance <= 0 || meter.rate_per_unit <= 0 {
                 return Some(0); // Already depleted or no consumption
             }
-            
+
             let seconds_until_depletion = meter.balance / meter.rate_per_unit;
             let current_time = env.ledger().timestamp();
             Some(current_time + seconds_until_depletion as u64)
@@ -863,58 +983,74 @@ impl UtilityContract {
     pub fn emergency_shutdown(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
-        
+
         // Emergency shutdown always disables the meter regardless of balance
         meter.is_active = false;
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_rate_per_hour: i128) {
-        let mut meter: Meter = env.storage().instance().get(&DataKey::Meter(meter_id)).ok_or("Meter not found").unwrap();
+        let mut meter: Meter = env
+            .storage()
+            .instance()
+            .get(&DataKey::Meter(meter_id))
+            .ok_or("Meter not found")
+            .unwrap();
         meter.provider.require_auth();
-        
+
         meter.max_flow_rate_per_hour = max_rate_per_hour;
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn update_heartbeat(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
         meter.heartbeat = env.ledger().timestamp();
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
     }
 
     pub fn withdraw_earnings(env: Env, meter_id: u64, amount_usd_cents: i128) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
-        
+
         if amount_usd_cents <= 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
-        
+
         // Store old meter value for pool update
         let old_meter_value = provider_meter_value(&meter);
-        
+
         let available_earnings = match meter.billing_type {
             BillingType::PrePaid => meter.balance,
             BillingType::PostPaid => meter.debt,
         };
-        
+
         if amount_usd_cents > available_earnings {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
-        
+
         // Convert USD cents to XLM if needed
-        let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, amount_usd_cents, &meter.token) {
-            Ok(amount) => amount,
-            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
-        };
-        
+        let withdrawal_amount =
+            match convert_usd_to_xlm_if_needed(&env, amount_usd_cents, &meter.token) {
+                Ok(amount) => amount,
+                Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+            };
+
         let client = token::Client::new(&env, &meter.token);
-        client.transfer(&env.current_contract_address(), &meter.provider, &withdrawal_amount);
-        
+        client.transfer(
+            &env.current_contract_address(),
+            &meter.provider,
+            &withdrawal_amount,
+        );
+
         // Update meter balance/debt
         match meter.billing_type {
             BillingType::PrePaid => {
@@ -924,32 +1060,38 @@ impl UtilityContract {
                 meter.debt = meter.debt.saturating_sub(amount_usd_cents);
             }
         }
-        
+
         let now = env.ledger().timestamp();
         let was_active = meter.is_active;
-        refresh_activity(&mut meter);
-        
+        refresh_activity(&mut meter, now);
+
         if !was_active && meter.is_active {
             meter.last_update = now;
         }
-        
+
         // Update provider total pool
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
-        
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
+
         // Emit conversion event if XLM was used
         if is_native_token(&meter.token) {
             env.events().publish(
-                (symbol_short!("USDtoXLM"), meter_id), 
-                (amount_usd_cents, withdrawal_amount)
+                (symbol_short!("USDtoXLM"), meter_id),
+                (amount_usd_cents, withdrawal_amount),
             );
         }
     }
 
     pub fn get_current_rate(env: Env) -> Option<PriceData> {
-        match env.storage().instance().get::<DataKey, Address>(&DataKey::Oracle) {
+        match env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Oracle)
+        {
             Some(oracle_address) => {
                 let oracle_client = PriceOracleClient::new(&env, &oracle_address);
                 Some(oracle_client.get_price())
@@ -997,16 +1139,20 @@ impl UtilityContract {
         let new_meter_value = provider_meter_value(&meter);
         update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
 
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(meter_id), &meter);
 
-        env.events().publish(
-            (symbol_short!("Transfer"), meter_id),
-            (old_user, new_user),
-        );
+        env.events()
+            .publish((symbol_short!("Transfer"), meter_id), (old_user, new_user));
     }
 }
 
-fn verify_usage_signature(env: &Env, signed_data: &SignedUsageData, meter: &Meter) -> Result<(), ContractError> {
+fn verify_usage_signature(
+    env: &Env,
+    signed_data: &SignedUsageData,
+    meter: &Meter,
+) -> Result<(), ContractError> {
     // Check if the provided public key matches the registered meter's public key
     if signed_data.public_key != meter.device_public_key {
         return Err(ContractError::PublicKeyMismatch);
