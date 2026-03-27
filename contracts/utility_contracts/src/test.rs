@@ -1399,3 +1399,287 @@ fn test_get_current_rate() {
 
 // NOTE: Postpaid native XLM flow test removed — env.token() is not available in this SDK version.
 
+#[test]
+fn test_set_and_get_closing_fee() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    // Test default closing fee
+    let default_fee = client.get_closing_fee();
+    assert_eq!(default_fee, 100); // Default 1% (100 bps)
+    
+    // Test setting valid closing fee
+    client.set_closing_fee(&200); // 2%
+    assert_eq!(client.get_closing_fee(), 200);
+    
+    // Test setting zero fee
+    client.set_closing_fee(&0);
+    assert_eq!(client.get_closing_fee(), 0);
+    
+    // Test setting maximum fee (10%)
+    client.set_closing_fee(&1000);
+    assert_eq!(client.get_closing_fee(), 1000);
+}
+
+#[test]
+#[should_panic(expected = "ContractError(18)")]
+fn test_set_invalid_closing_fee_too_high() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    // Should panic - fee too high (>10%)
+    client.set_closing_fee(&1001);
+}
+
+#[test]
+#[should_panic(expected = "ContractError(18)")]
+fn test_set_invalid_closing_fee_negative() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    // Should panic - negative fee
+    client.set_closing_fee(&-1);
+}
+
+#[test]
+fn test_close_account_and_refund_prepaid() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let maintenance_wallet = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    
+    // Setup
+    token_admin_client.mint(&user, &10000);
+    client.set_maintenance_config(&maintenance_wallet, &0); // No protocol fee for this test
+    client.set_closing_fee(&200); // 2% closing fee
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter_with_mode(
+        &user,
+        &provider,
+        &1000,
+        &token_address,
+        &BillingType::PrePaid,
+        &device_public_key,
+    );
+    
+    // Top up meter
+    token_client.approve(&user, &contract_address, &5000);
+    client.top_up(&meter_id, &5000);
+    
+    // Check initial state
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 5000);
+    assert!(!meter.is_closed);
+    assert_eq!(token.balance(&user), 5000); // 10000 - 5000
+    
+    // Get refund estimate
+    let estimate = client.get_refund_estimate(&meter_id).unwrap();
+    assert_eq!(estimate, (5000, 100, 4900)); // (total, fee, refund)
+    
+    // Close account and refund
+    client.close_account_and_refund(&meter_id);
+    
+    // Check final state
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 0);
+    assert!(meter.is_closed);
+    assert!(!meter.is_active);
+    
+    // Check token balances
+    assert_eq!(token.balance(&user), 9900); // 5000 + 4900 refund
+    assert_eq!(token.balance(&maintenance_wallet), 100); // 2% closing fee
+    assert_eq!(token.balance(&contract_address), 0); // All funds withdrawn
+}
+
+#[test]
+fn test_close_account_and_refund_postpaid() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let maintenance_wallet = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    
+    // Setup
+    token_admin_client.mint(&user, &10000);
+    client.set_maintenance_config(&maintenance_wallet, &0);
+    client.set_closing_fee(&500); // 5% closing fee
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter_with_mode(
+        &user,
+        &provider,
+        &1000,
+        &token_address,
+        &BillingType::PostPaid,
+        &device_public_key,
+    );
+    
+    // Add collateral for postpaid
+    token_client.approve(&user, &contract_address, &3000);
+    client.top_up(&meter_id, &3000);
+    
+    // Check initial state
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.collateral_limit, 3000);
+    assert_eq!(meter.debt, 0);
+    assert!(!meter.is_closed);
+    
+    // Get refund estimate
+    let estimate = client.get_refund_estimate(&meter_id).unwrap();
+    assert_eq!(estimate, (3000, 150, 2850)); // (total, fee, refund)
+    
+    // Close account and refund
+    client.close_account_and_refund(&meter_id);
+    
+    // Check final state
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.collateral_limit, 0);
+    assert_eq!(meter.debt, 0);
+    assert!(meter.is_closed);
+    assert!(!meter.is_active);
+    
+    // Check token balances
+    assert_eq!(token.balance(&user), 12850); // 10000 - 3000 + 2850 refund
+    assert_eq!(token.balance(&maintenance_wallet), 150); // 5% closing fee
+}
+
+#[test]
+#[should_panic(expected = "ContractError(17)")]
+fn test_close_already_closed_account() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    
+    // Setup
+    token_admin_client.mint(&user, &5000);
+    client.set_closing_fee(&100);
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1000, &token_address);
+    
+    // Top up and close account
+    token_admin_client.mint(&user, &5000);
+    let token = token::Client::new(&env, &token_address);
+    token.approve(&user, &contract_address, &2000);
+    client.top_up(&meter_id, &2000);
+    client.close_account_and_refund(&meter_id);
+    
+    // Try to close again - should panic
+    client.close_account_and_refund(&meter_id);
+}
+
+#[test]
+#[should_panic(expected = "ContractError(16)")]
+fn test_close_account_with_no_balance() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    
+    // Setup meter with no balance
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1000, &token_address);
+    
+    // Try to close account with no balance - should panic
+    client.close_account_and_refund(&meter_id);
+}
+
+#[test]
+fn test_close_account_with_zero_closing_fee() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let maintenance_wallet = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    
+    // Setup with zero closing fee
+    token_admin_client.mint(&user, &5000);
+    client.set_closing_fee(&0); // 0% closing fee
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1000, &token_address);
+    
+    // Top up and close
+    token.approve(&user, &contract_address, &2000);
+    client.top_up(&meter_id, &2000);
+    client.close_account_and_refund(&meter_id);
+    
+    // Check that user gets full refund
+    assert_eq!(token.balance(&user), 5000); // 3000 + 2000 full refund
+    assert_eq!(token.balance(&maintenance_wallet), 0); // No closing fee
+}
+
+#[test]
+fn test_refund_estimate_for_closed_account() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+    
+    // Setup
+    token_admin_client.mint(&user, &3000);
+    client.set_closing_fee(&200);
+    
+    let device_public_key = BytesN::from_array(&env, &[0; 32]);
+    let meter_id = client.register_meter(&user, &provider, &1000, &token_address);
+    
+    // Top up and close account
+    let token = token::Client::new(&env, &token_address);
+    token.approve(&user, &contract_address, &1000);
+    client.top_up(&meter_id, &1000);
+    client.close_account_and_refund(&meter_id);
+    
+    // Refund estimate should return None for closed account
+    let estimate = client.get_refund_estimate(&meter_id);
+    assert_eq!(estimate, None);
+}
+
+#[test]
+fn test_refund_estimate_for_nonexistent_meter() {
+    let env = Env::default();
+    let contract_address = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_address);
+    
+    // Refund estimate should return None for nonexistent meter
+    let estimate = client.get_refund_estimate(&999);
+    assert_eq!(estimate, None);
+}
+

@@ -89,6 +89,7 @@ pub struct Meter {
     pub heartbeat: u64,
     pub device_public_key: BytesN<32>,
     pub is_paired: bool,
+    pub is_closed: bool,
 }
 
 #[contracttype]
@@ -109,6 +110,7 @@ pub enum DataKey {
     ProtocolFeeBps,
     SupportedToken(Address),
     ProviderTotalPool(Address),
+    ClosingFeeBps,
 }
 
 #[contracterror]
@@ -130,6 +132,9 @@ pub enum ContractError {
     ChallengeNotFound = 13,
     InvalidPairingSignature = 14,
     MeterNotPaired = 15,
+    InsufficientBalance = 16,
+    AccountAlreadyClosed = 17,
+    InvalidClosingFee = 18,
 }
 
 #[contracttype]
@@ -491,6 +496,7 @@ impl UtilityContract {
             heartbeat: now,
             device_public_key,
             is_paired: false,
+            is_closed: false,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1003,6 +1009,136 @@ impl UtilityContract {
             (symbol_short!("Transfer"), meter_id),
             (old_user, new_user),
         );
+    }
+
+    pub fn set_closing_fee(env: Env, fee_bps: i128) {
+        // Validate fee is within reasonable bounds (0-1000 bps = 0-10%)
+        if fee_bps < 0 || fee_bps > 1000 {
+            panic_with_error!(env, ContractError::InvalidClosingFee);
+        }
+        env.storage().instance().set(&DataKey::ClosingFeeBps, &fee_bps);
+    }
+
+    pub fn get_closing_fee(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClosingFeeBps)
+            .unwrap_or(100) // Default 1% (100 bps)
+    }
+
+    /// Close account and withdraw remaining balance minus closing fee
+    /// Users can call this to permanently close their meter and get refunded
+    pub fn close_account_and_refund(env: Env, meter_id: u64) {
+        let mut meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+
+        // Check if account is already closed
+        if meter.is_closed {
+            panic_with_error!(env, ContractError::AccountAlreadyClosed);
+        }
+
+        // Store old meter value for pool update
+        let old_meter_value = provider_meter_value(&meter);
+
+        // Calculate refundable amount based on billing type
+        let refundable_amount = match meter.billing_type {
+            BillingType::PrePaid => meter.balance,
+            BillingType::PostPaid => {
+                // For postpaid, refund any remaining collateral
+                remaining_postpaid_collateral(&meter)
+            }
+        };
+
+        // Check if there's anything to refund
+        if refundable_amount <= 0 {
+            panic_with_error!(env, ContractError::InsufficientBalance);
+        }
+
+        // Get closing fee and calculate fee amount
+        let closing_fee_bps = Self::get_closing_fee(env.clone());
+        let closing_fee_amount = (refundable_amount * closing_fee_bps) / 10000;
+        let final_refund_amount = refundable_amount.saturating_sub(closing_fee_amount);
+
+        // Convert USD cents to XLM if needed for withdrawal
+        let withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, final_refund_amount, &meter.token) {
+            Ok(amount) => amount,
+            Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+        };
+
+        // Transfer closing fee to maintenance wallet if configured
+        if closing_fee_amount > 0 {
+            if let Some(maintenance_wallet) = env.storage().instance().get::<_, Address>(&DataKey::MaintenanceWallet) {
+                let fee_withdrawal_amount = match convert_usd_to_xlm_if_needed(&env, closing_fee_amount, &meter.token) {
+                    Ok(amount) => amount,
+                    Err(_) => panic_with_error!(&env, ContractError::PriceConversionFailed),
+                };
+                
+                let token_client = token::Client::new(&env, &meter.token);
+                token_client.transfer(&env.current_contract_address(), &maintenance_wallet, &fee_withdrawal_amount);
+            }
+        }
+
+        // Transfer refund to user
+        if final_refund_amount > 0 {
+            let token_client = token::Client::new(&env, &meter.token);
+            token_client.transfer(&env.current_contract_address(), &meter.user, &withdrawal_amount);
+        }
+
+        // Close the account
+        meter.is_closed = true;
+        meter.is_active = false;
+        meter.balance = 0;
+        meter.debt = 0;
+        meter.collateral_limit = 0;
+
+        let now = env.ledger().timestamp();
+        meter.last_update = now;
+
+        // Update provider total pool
+        let new_meter_value = provider_meter_value(&meter);
+        update_provider_total_pool(&env, &meter.provider, old_meter_value, new_meter_value);
+
+        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+
+        // Emit events
+        env.events().publish(
+            (symbol_short!("AccountClosed"), meter_id),
+            (refundable_amount, closing_fee_amount, final_refund_amount)
+        );
+
+        // Emit conversion event if XLM was used
+        if is_native_token(&meter.token) {
+            env.events().publish(
+                (symbol_short!("RefundUSDToXLM"), meter_id), 
+                (final_refund_amount, withdrawal_amount)
+            );
+        }
+    }
+
+    /// Get refund estimate for a meter (does not execute the refund)
+    pub fn get_refund_estimate(env: Env, meter_id: u64) -> Option<(i128, i128, i128)> {
+        if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(meter_id)) {
+            if meter.is_closed {
+                return None;
+            }
+
+            let refundable_amount = match meter.billing_type {
+                BillingType::PrePaid => meter.balance,
+                BillingType::PostPaid => remaining_postpaid_collateral(&meter),
+            };
+
+            if refundable_amount <= 0 {
+                return None;
+            }
+
+            let closing_fee_bps = Self::get_closing_fee(env.clone());
+            let closing_fee_amount = (refundable_amount * closing_fee_bps) / 10000;
+            let final_refund_amount = refundable_amount.saturating_sub(closing_fee_amount);
+
+            Some((refundable_amount, closing_fee_amount, final_refund_amount))
+        } else {
+            None
+        }
     }
 }
 
