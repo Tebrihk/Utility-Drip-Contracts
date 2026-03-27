@@ -9,7 +9,9 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "jest",
-    "lint": "eslint src/"
+    "lint": "eslint src/",
+    "ttl-monitor": "node src/ttl-monitor.js",
+    "ttl-check": "node src/ttl-monitor.js --check-only"
   },
   "keywords": ["iot", "stellar", "soroban", "utility", "meter", "simulator"],
   "author": "Utility Drip Team",
