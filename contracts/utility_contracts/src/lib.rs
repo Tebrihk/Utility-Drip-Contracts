@@ -9,12 +9,20 @@ use soroban_sdk::{
 
 // Oracle client interface
 use soroban_sdk::contractclient;
+const DEFAULT_BUFFER_DAYS: i128 = 3;
+const TRUSTED_BUFFER_DAYS: i128 = 1;
 
 #[contractclient(name = "PriceOracleClient")]
 pub trait PriceOracle {
     fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128;
     fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128;
     fn get_price(env: Env) -> PriceData;
+}
+
+#[contractclient(name = "SoroSusuClient")]
+pub trait SoroSusu {
+    fn get_susu_score(env: Env, user: Address) -> u32;
+    fn is_trusted_saver(env: Env, user: Address) -> bool;
 }
 
 #[contracttype]
@@ -201,6 +209,17 @@ pub struct AdminTransferProposal {
     pub is_active: bool,
 }
 
+pub fn set_sorosusu_contract(env: Env, addr: Address) {
+    env.storage().instance().set(&DataKey::SoroSusuContract, &addr);
+}
+
+fn get_sorosusu_contract(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get(&DataKey::SoroSusuContract)
+        .unwrap()
+}
+
 // Task #2: Legal Freeze
 #[contracttype]
 #[derive(Clone)]
@@ -292,6 +311,7 @@ pub enum DataKey {
     VerifiedProvider(Address),
     // Task #4: Sub-DAO
     SubDaoConfig(Address),
+    SoroSusuContract,
 }
 
 #[contracterror]
@@ -760,6 +780,25 @@ fn check_throttling_threshold(env: &Env, meter: &Meter) -> bool {
     // If balance is less than 20% of total value, trigger throttling
     let threshold = (total_value * THROTTLING_THRESHOLD_PERCENT) / 100;
     meter.balance < threshold
+}
+
+fn calculate_required_buffer(
+    env: &Env,
+    user: &Address,
+    daily_rate: i128,
+) -> i128 {
+    let sorosusu_contract = get_sorosusu_contract(env);
+    let client = SoroSusuClient::new(env, &sorosusu_contract);
+
+    let is_trusted = client.is_trusted_saver(user.clone());
+
+    let buffer_days = if is_trusted {
+        TRUSTED_BUFFER_DAYS
+    } else {
+        DEFAULT_BUFFER_DAYS
+    };
+
+    daily_rate * buffer_days
 }
 
 fn should_pause_low_priority_stream(meter: &Meter, throttling_active: bool) -> bool {
