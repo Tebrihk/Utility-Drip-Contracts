@@ -312,6 +312,17 @@ pub struct SubDaoConfig {
     pub is_active: bool,
 }
 
+// ============================================================
+// ISSUE #131: Public Utility Health Index Metrics
+// ============================================================
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ImpactMetrics {
+    pub total_kilowatts_funded: i128,
+    pub total_liters_streamed: i128,
+    pub active_meters: u32,
+}
+
 #[contracttype]
 pub enum DataKey {
     Meter(u64),
@@ -768,7 +779,7 @@ fn convert_usd_to_token_if_needed(
 
 fn get_platform_fee_bps_impl(env: &Env, user: &Address) -> i128 {
     let base_fee: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
-    
+
     // Issue #124: Loyalty-Based Staking Fee Reduction
     if let Some(vault_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::VestingVault) {
         let vault_client = VestingVaultClient::new(env, &vault_address);
@@ -1923,10 +1934,10 @@ impl UtilityContract {
                 if let Some(minter_addr) = env.storage().instance().get::<DataKey, Address>(&DataKey::NFTMinter) {
                     let cycle_index: u32 = env.storage().instance().get(&DataKey::CycleIndex(signed_data.meter_id)).unwrap_or(0);
                     let next_cycle = cycle_index + 1;
-                    
+
                     let minter = NFTMinterClient::new(&env, &minter_addr);
                     minter.mint_receipt_nft(&meter.user, &signed_data.meter_id, &next_cycle);
-                    
+
                     env.storage().instance().set(&DataKey::CycleIndex(signed_data.meter_id), &next_cycle);
                     env.events().publish((symbol_short!("NFTMint"), signed_data.meter_id), next_cycle);
                 }
@@ -2984,11 +2995,11 @@ impl UtilityContract {
 
     pub fn group_top_up(env: Env, parent_account: Address, amount_per_meter: i128) {
         parent_account.require_auth();
-        
+
         let billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
             .get(&DataKey::BillingGroup(parent_account.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
-        
+
         if billing_group.child_meters.is_empty() {
             return;
         }
@@ -3039,11 +3050,11 @@ impl UtilityContract {
 
     pub fn remove_meter_from_billing_group(env: Env, parent_account: Address, meter_id: u64) {
         parent_account.require_auth();
-        
+
         let mut billing_group: BillingGroup = env.storage().instance().get(&DataKey::BillingGroup(parent_account.clone()))
             .get(&DataKey::BillingGroup(parent_account.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, ContractError::BillingGroupNotFound));
-        
+
         billing_group.child_meters.retain(|&id| id != meter_id);
         env.storage()
             .instance()
@@ -3265,7 +3276,7 @@ impl UtilityContract {
         if final_claimable > 0 {
             let client = token::Client::new(&env, &meter.token);
             client.transfer(&env.current_contract_address(), &meter.provider, &final_claimable);
-            
+
             meter.balance -= final_claimable;
             meter.claimed_this_hour += final_claimable;
 
@@ -4415,6 +4426,48 @@ impl UtilityContract {
     /// Process an approved insurance claim
     pub fn process_approved_claim(env: Env, claim_id: u64) -> Result<(), ContractError> {
         process_approved_claim(&env, claim_id)
+    }
+
+    // ============================================================
+    // ISSUE #131: PUBLIC UTILITY HEALTH INDEX API
+    // ============================================================
+
+    /// Publicly queryable endpoint to prove real-world social impact to grantors and foundations.
+    /// Aggregates total energy consumption (Total_Kilowatts_Funded) and total
+    /// value successfully streamed/claimed (representing Total_Liters_of_Water_Streamed).
+    pub fn get_public_utility_health_index(env: Env) -> ImpactMetrics {
+        let count: u64 = env.storage().instance().get(&DataKey::Count).unwrap_or(0);
+
+        let mut total_watt_hours: i128 = 0;
+        let mut total_value_streamed: i128 = 0;
+        let mut active_meters: u32 = 0;
+
+        // Iterate through all registered meters to aggregate global impact
+        for i in 1..=count {
+            if let Some(meter) = env.storage().instance().get::<_, Meter>(&DataKey::Meter(i)) {
+                // 1. Aggregate Energy Usage (Convert watt-hours to Kilowatts later if needed, returning raw for precision)
+                total_watt_hours = total_watt_hours.saturating_add(meter.usage_data.total_watt_hours);
+
+                // 2. Aggregate "Water" (Value successfully delivered/claimed by providers)
+                // In this contract's context, the historical volume delivered is tracked via monthly_volume or provider pools.
+                // We use monthly_volume as a proxy for total historical flow units.
+                total_value_streamed = total_value_streamed.saturating_add(meter.usage_data.monthly_volume);
+
+                // 3. Track active infrastructure
+                if meter.is_active && !meter.is_paused {
+                    active_meters = active_meters.saturating_add(1);
+                }
+            }
+        }
+
+        // Convert watt-hours to kilowatts (divide by 1000) for the public API
+        let total_kilowatts_funded = total_watt_hours / 1000;
+
+        ImpactMetrics {
+            total_kilowatts_funded,
+            total_liters_streamed: total_value_streamed,
+            active_meters,
+        }
     }
 }
 
