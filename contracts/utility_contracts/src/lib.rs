@@ -186,7 +186,7 @@ pub struct LowBalanceAlert {
     pub meter_id: u64,
     pub user: Address,
     pub remaining_balance: i128,
-    pub hours_remaining: f32,
+    pub hours_remaining: i32, // store as integer hours
     pub timestamp: u64,
 }
 
@@ -312,6 +312,14 @@ pub struct SubDaoConfig {
     pub is_active: bool,
 }
 
+// Reseller Revenue Sharing: Three-Way Split
+#[contracttype]
+#[derive(Clone)]
+pub struct ResellerConfig {
+    pub reseller: Address,
+    pub fee_bps: i128, // Reseller's cut in basis points (e.g., 500 = 5%)
+}
+
 #[contracttype]
 pub enum DataKey {
     Meter(u64),
@@ -340,6 +348,7 @@ pub enum DataKey {
     AuthorizedContributor(u64, Address),
     // Task #2: Tax Compliance
     GovernmentVault(Address),
+    GovernmentVaultSingleton,
     TaxRateBps, // Tax rate in basis points (e.g., 500 = 5%)
     // Task #3: Self-Maintenance
     MaintenanceFund(u64), // Per-meter maintenance fund balance
@@ -374,6 +383,10 @@ pub enum DataKey {
     InsuranceRiskAssessment(Address),
     InsuranceNextProposalId,
     InsuranceNextClaimId,
+    // Reseller Revenue Sharing
+    ResellerConfig(u64),                  // meter_id -> ResellerConfig
+    ResellerEarnings(Address, Address),   // (reseller, token) -> accumulated i128
+    ResellerWithdrawn(Address, Address),  // (reseller, token) -> total withdrawn i128
 }
 
 #[contracterror]
@@ -464,6 +477,10 @@ pub enum ContractError {
     InsufficientVotingPower = 70,
     InvalidProposalType = 71,
     NotImplemented = 72,
+    // Reseller Revenue Sharing Errors
+    ResellerNotAssigned = 73,
+    InvalidResellerFee = 74,
+    NoResellerEarnings = 75,
 }
 
 #[contracttype]
@@ -772,7 +789,7 @@ fn get_platform_fee_bps_impl(env: &Env, user: &Address) -> i128 {
     // Issue #124: Loyalty-Based Staking Fee Reduction
     if let Some(vault_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::VestingVault) {
         let vault_client = VestingVaultClient::new(env, &vault_address);
-        if vault_client.get_staked_balance(user.clone()) > 0 {
+        if vault_client.get_staked_balance(&user) > 0 {
             return base_fee / 2; // 50% discount for staked users
         }
     }
@@ -979,12 +996,43 @@ fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
     meter.claimed_this_hour = meter.claimed_this_hour.saturating_add(amount);
 }
 
-struct ClaimSettlement {
-    gross_claimed: i128,
-    provider_payout: i128,
-    tax_amount: i128,
-    protocol_fee: i128,
     insurance_pool_fee: i128,
+    reseller_payout: i128,
+}
+
+// Reseller Revenue Sharing Helper Functions
+/// Maximum reseller fee: 20% (2000 basis points)
+const MAX_RESELLER_FEE_BPS: i128 = 2000;
+
+fn get_reseller_config_impl(env: &Env, meter_id: u64) -> Option<ResellerConfig> {
+    env.storage()
+        .instance()
+        .get::<DataKey, ResellerConfig>(&DataKey::ResellerConfig(meter_id))
+}
+
+fn get_reseller_cut(env: &Env, meter_id: u64, provider_share: i128) -> i128 {
+    match get_reseller_config_impl(env, meter_id) {
+        Some(config) => (provider_share * config.fee_bps) / 10_000,
+        None => 0,
+    }
+}
+
+fn accumulate_reseller_earnings(env: &Env, meter_id: u64, token: &Address, amount: i128) {
+    if let Some(config) = get_reseller_config_impl(env, meter_id) {
+        let key = DataKey::ResellerEarnings(config.reseller.clone(), token.clone());
+        let current: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&key, &current.saturating_add(amount));
+    }
+}
+
+fn get_reseller_earnings_impl(env: &Env, reseller: &Address, token: &Address) -> i128 {
+    env.storage()
+        .instance()
+        .get::<DataKey, i128>(&DataKey::ResellerEarnings(reseller.clone(), token.clone()))
+        .unwrap_or(0)
+}
 }
 
 fn settle_claim_for_meter(
@@ -1032,7 +1080,11 @@ fn settle_claim_for_meter(
         provider_payout: 0,
         tax_amount: 0,
         protocol_fee: 0,
+<<<<<<< HEAD
         insurance_pool_fee: 0,
+=======
+        reseller_payout: 0,
+>>>>>>> 99df073 (Fix all Soroban contract build errors, enforce three-way split, and update for SDK compliance)
     };
 
     if claimable > 0 {
@@ -1058,7 +1110,16 @@ fn settle_claim_for_meter(
             0
         };
 
-        let provider_payout = after_tax_amount.saturating_sub(protocol_fee);
+        let after_protocol = after_tax_amount.saturating_sub(protocol_fee);
+
+        // Three-Way Split: calculate reseller cut from provider's share
+        let reseller_payout = get_reseller_cut(env, meter_id, after_protocol);
+        let provider_payout = after_protocol.saturating_sub(reseller_payout);
+
+        // Accumulate reseller earnings for independent withdrawal
+        if reseller_payout > 0 {
+            accumulate_reseller_earnings(env, meter_id, &meter.token, reseller_payout);
+        }
 
         meter.balance = meter.balance.saturating_sub(claimable);
         if same_hour {
@@ -1079,7 +1140,11 @@ fn settle_claim_for_meter(
             provider_payout,
             tax_amount,
             protocol_fee,
+<<<<<<< HEAD
             insurance_pool_fee,
+=======
+            reseller_payout,
+>>>>>>> 99df073 (Fix all Soroban contract build errors, enforce three-way split, and update for SDK compliance)
         };
     } else if !same_hour {
         meter.claimed_this_hour = 0;
@@ -1158,6 +1223,9 @@ fn register_meter_internal(
         credit_drip_rate: 0,
         is_closed: false,
         priority_index,
+        milestone_confirmed: false,
+        milestone_deadline: 0,
+        off_peak_reward_rate_bps: 0,
     };
 
     env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1198,7 +1266,7 @@ fn calculate_required_buffer(env: &Env, user: &Address, daily_rate: i128) -> i12
     let sorosusu_contract = get_sorosusu_contract(env);
     let client = SoroSusuClient::new(env, &sorosusu_contract);
 
-    let is_trusted = client.is_trusted_saver(user.clone());
+    let is_trusted = client.is_trusted_saver(&user);
 
     let buffer_days = if is_trusted {
         TRUSTED_BUFFER_DAYS
@@ -1222,7 +1290,7 @@ fn calculate_tax_split(amount: i128, tax_rate_bps: i128) -> (i128, i128) {
 }
 
 fn get_government_vault_or_default(env: &Env) -> Option<Address> {
-    env.storage().instance().get(&DataKey::GovernmentVault)
+    env.storage().instance().get(&DataKey::GovernmentVaultSingleton)
 }
 
 fn get_tax_rate_or_default(env: &Env) -> i128 {
@@ -1315,7 +1383,7 @@ fn propose_upgrade_impl(env: &Env, new_wasm_hash: BytesN<32>, proposer: &Address
         .set(&DataKey::VetoDeadline, &veto_deadline);
 
     env.events().publish(
-        soroban_sdk::symbol_short!("UpgrdPrp"),
+        (soroban_sdk::symbol_short!("UpgrdPrp"),),
         (new_wasm_hash, now, veto_deadline),
     );
 
@@ -1335,7 +1403,7 @@ fn submit_veto(env: &Env, user: &Address, proposal_id: u64) {
         .set(&DataKey::UserVetoed(user.clone(), proposal_id), &true);
 
     env.events()
-        .publish(soroban_sdk::symbol_short!("VetoSubmt"), (user, proposal_id));
+        .publish((soroban_sdk::symbol_short!("VetoSubmt"),), (user, proposal_id));
 }
 
 fn can_finalize_upgrade(env: &Env) -> bool {
@@ -1417,7 +1485,7 @@ impl UtilityContract {
     }
 
     /// Remove a supported withdrawal token for path payments
-    pub fn remove_supported_withdrawal_token(env: Env, token: Address) {
+    pub fn remove_withdraw_token(env: Env, token: Address) {
         env.storage()
             .instance()
             .set(&DataKey::SupportedWithdrawalToken(token), &false);
@@ -1513,7 +1581,11 @@ impl UtilityContract {
             token,
             billing_type,
             device_public_key,
+<<<<<<< HEAD
             priority_index,
+=======
+            0,
+>>>>>>> 99df073 (Fix all Soroban contract build errors, enforce three-way split, and update for SDK compliance)
         )
     }
 
@@ -1566,7 +1638,7 @@ impl UtilityContract {
                 billing_type: meter_info.billing_type,
                 off_peak_rate: meter_info.off_peak_rate,
                 peak_rate,
-                rate_per_second: meter_info.off_peak_rate,
+                rate_per_second: 0,
                 rate_per_unit: meter_info.off_peak_rate,
                 green_energy_discount_bps: 0,
                 balance: 0,
@@ -1593,6 +1665,12 @@ impl UtilityContract {
                 credit_drip_rate: 0,
                 is_closed: false,
                 priority_index: 0,
+                milestone_confirmed: false,
+                milestone_deadline: 0,
+                off_peak_reward_rate_bps: 0,
+                milestone_confirmed: false,
+                milestone_deadline: 0,
+                off_peak_reward_rate_bps: 0,
             };
 
             env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1628,7 +1706,7 @@ impl UtilityContract {
 
         // Emit single BatchCreated event
         env.events().publish(
-            symbol_short!("BatchCreated"),
+            symbol_short!("BatchCrt"),
             (batch_event.start_id, batch_event.end_id, batch_event.count),
         );
 
@@ -1804,7 +1882,7 @@ impl UtilityContract {
             .set(&DataKey::Meter(meter_id), &meter);
 
         env.events()
-            .publish((symbol_short!("PairComplete"), meter_id), signature);
+            .publish((symbol_short!("PairComp"), meter_id), signature);
     }
 
     pub fn deduct_units(env: Env, signed_data: SignedUsageData) {
@@ -1812,7 +1890,9 @@ impl UtilityContract {
         meter.provider.require_auth();
 
         // Verify the signature and pairing
-        verify_usage_signature(&env, &signed_data, &meter)?;
+        if let Err(e) = verify_usage_signature(&env, &signed_data, &meter) {
+            panic_with_error!(&env, e);
+        }
 
         // Task #88: Kill-Switch Check
         if meter.is_disputed {
@@ -1830,7 +1910,6 @@ impl UtilityContract {
         let effective_rate = get_effective_rate(
             &meter,
             signed_data.timestamp,
-            signed_data.is_renewable_energy,
         );
         let cost = signed_data.units_consumed.saturating_mul(effective_rate);
 
@@ -1972,6 +2051,7 @@ impl UtilityContract {
         let settlement = settle_claim_for_meter(&env, meter_id, &mut meter, now, &mut window);
         let client = token::Client::new(&env, &meter.token);
 
+        // Three-way split payouts
         if settlement.tax_amount > 0 {
             if let Some(gov_vault) = get_government_vault_or_default(&env) {
                 client.transfer(
@@ -1992,6 +2072,16 @@ impl UtilityContract {
                     &env.current_contract_address(),
                     &wallet,
                     &settlement.protocol_fee,
+                );
+            }
+        }
+
+        if settlement.reseller_payout > 0 {
+            if let Some(config) = get_reseller_config_impl(&env, meter_id) {
+                client.transfer(
+                    &env.current_contract_address(),
+                    &config.reseller,
+                    &settlement.reseller_payout,
                 );
             }
         }
@@ -2101,9 +2191,6 @@ impl UtilityContract {
             .get(&DataKey::ProviderWindow(provider))
     }
 
-    pub fn get_provider_total_pool(env: Env, provider: Address) -> i128 {
-        get_provider_total_pool_impl(&env, &provider)
-    }
 
     pub fn get_watt_hours_display(precise_watt_hours: i128, precision_factor: i128) -> i128 {
         if precision_factor <= 0 {
@@ -2515,9 +2602,6 @@ impl UtilityContract {
         }
     }
 
-    pub fn get_watt_hours_display(watt_hours: i128, precision_factor: i128) -> i128 {
-        watt_hours / precision_factor
-    }
 
     /// Unlink a meter from its current tenant and link it to a new tenant.
     /// All historical usage data is preserved. Requires auth from the current
@@ -2654,14 +2738,14 @@ impl UtilityContract {
 
         // Emit events
         env.events().publish(
-            (symbol_short!("AccountClosed"), meter_id),
+            (symbol_short!("AcctClose"), meter_id),
             (refundable_amount, closing_fee_amount, final_refund_amount),
         );
 
         // Emit conversion event if XLM was used
         if is_native_token(&env, &meter.token) {
             env.events().publish(
-                (symbol_short!("RefundUSDToXLM"), meter_id),
+                (symbol_short!("RefndUSDX"), meter_id),
                 (final_refund_amount, withdrawal_amount),
             );
         }
@@ -2760,7 +2844,7 @@ impl UtilityContract {
 
         // Emit path payment event
         env.events().publish(
-            (symbol_short!("PathPayment"), meter_id),
+            (symbol_short!("PathPay"), meter_id),
             (
                 meter.token,
                 destination_token,
@@ -3480,9 +3564,10 @@ impl UtilityContract {
         env.storage()
             .instance()
             .set(&DataKey::GovernmentVault, &vault_address);
+    env.storage().instance().set(&DataKey::GovernmentVaultSingleton, &vault_address);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("GovVault"), vault_address);
+            .publish((soroban_sdk::symbol_short!("GovVault"),), vault_address);
     }
 
     // Task #2: Tax Compliance - Set tax rate (in basis points)
@@ -3497,7 +3582,7 @@ impl UtilityContract {
             .set(&DataKey::TaxRateBps, &tax_rate_bps);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("TaxRate"), tax_rate_bps);
+            .publish((soroban_sdk::symbol_short!("TaxRate"),), tax_rate_bps);
     }
 
     // Task #3: Self-Maintenance - Get maintenance fund balance for a meter
@@ -3562,7 +3647,7 @@ impl UtilityContract {
         let proposal_id = propose_upgrade_impl(&env, new_wasm_hash, &proposer);
 
         env.events()
-            .publish(soroban_sdk::symbol_short!("UpgrdProp"), proposal_id);
+            .publish((soroban_sdk::symbol_short!("UpgrdProp"),), proposal_id);
     }
 
     // Task #4: Wasm Hash Rotation - Submit veto
@@ -3602,7 +3687,7 @@ impl UtilityContract {
         // In a real implementation, this would call env.deployer().update_current_contract_wasm()
         // For now, we just emit an event indicating the upgrade is ready
         env.events().publish(
-            soroban_sdk::symbol_short!("UpgrdFinsh"),
+            soroban_sdk::symbol_short!("UpgrdFin"),
             proposal.new_wasm_hash,
         );
 
@@ -4320,11 +4405,12 @@ impl UtilityContract {
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
 
         env.events().publish(
-            (symbol_short!("MstoneConf"), meter_id),
+            (symbol_short!("MstnConf"), meter_id),
             env.ledger().timestamp(),
         );
     }
 
+<<<<<<< HEAD
     // ============================================================================
     // INSURANCE POOL GOVERNANCE METHODS
     // ============================================================================
@@ -4415,6 +4501,104 @@ impl UtilityContract {
     /// Process an approved insurance claim
     pub fn process_approved_claim(env: Env, claim_id: u64) -> Result<(), ContractError> {
         process_approved_claim(&env, claim_id)
+=======
+    // ── Reseller Revenue Sharing ──────────────────────────────────────
+
+    /// Assign a reseller to a meter. Only the meter's provider can do this.
+    /// `fee_bps` is the reseller's cut in basis points (max 2000 = 20%).
+    pub fn assign_reseller(env: Env, meter_id: u64, reseller: Address, fee_bps: i128) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        if fee_bps <= 0 || fee_bps > MAX_RESELLER_FEE_BPS {
+            panic_with_error!(&env, ContractError::InvalidResellerFee);
+        }
+
+        let config = ResellerConfig {
+            reseller: reseller.clone(),
+            fee_bps,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::ResellerConfig(meter_id), &config);
+
+        env.events().publish(
+            (symbol_short!("RslrSet"), meter_id),
+            (reseller, fee_bps),
+        );
+    }
+
+    /// Remove the reseller from a meter. Only the meter's provider can do this.
+    pub fn remove_reseller(env: Env, meter_id: u64) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.provider.require_auth();
+
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::ResellerConfig(meter_id))
+        {
+            panic_with_error!(&env, ContractError::ResellerNotAssigned);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::ResellerConfig(meter_id));
+
+        env.events()
+            .publish((symbol_short!("RslrRmvd"), meter_id), ());
+    }
+
+    /// Reseller withdraws accumulated earnings for a given token.
+    /// This is the reseller's independent withdrawal counter.
+    pub fn reseller_withdraw(env: Env, reseller: Address, token: Address) {
+        reseller.require_auth();
+
+        let key = DataKey::ResellerEarnings(reseller.clone(), token.clone());
+        let earnings: i128 = env.storage().instance().get(&key).unwrap_or(0);
+
+        if earnings <= 0 {
+            panic_with_error!(&env, ContractError::NoResellerEarnings);
+        }
+
+        // Reset accumulated earnings to zero
+        env.storage().instance().set(&key, &0_i128);
+
+        // Track total withdrawn
+        let withdrawn_key = DataKey::ResellerWithdrawn(reseller.clone(), token.clone());
+        let total_withdrawn: i128 = env.storage().instance().get(&withdrawn_key).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&withdrawn_key, &total_withdrawn.saturating_add(earnings));
+
+        // Transfer earnings to reseller
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &reseller, &earnings);
+
+        env.events().publish(
+            (symbol_short!("RslrWdraw"), reseller),
+            (token, earnings),
+        );
+    }
+
+    /// View accumulated (unclaimed) reseller earnings for a given token.
+    pub fn get_reseller_earnings(env: Env, reseller: Address, token: Address) -> i128 {
+        get_reseller_earnings_impl(&env, &reseller, &token)
+    }
+
+    /// View total withdrawn reseller earnings for a given token.
+    pub fn get_reseller_total_withdrawn(env: Env, reseller: Address, token: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get::<DataKey, i128>(&DataKey::ResellerWithdrawn(reseller, token))
+            .unwrap_or(0)
+    }
+
+    /// View the reseller config for a meter (if any).
+    pub fn get_reseller_config(env: Env, meter_id: u64) -> Option<ResellerConfig> {
+        get_reseller_config_impl(&env, meter_id)
+>>>>>>> 99df073 (Fix all Soroban contract build errors, enforce three-way split, and update for SDK compliance)
     }
 }
 

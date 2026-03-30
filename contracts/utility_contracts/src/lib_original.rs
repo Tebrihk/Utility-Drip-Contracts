@@ -534,6 +534,9 @@ impl UtilityContract {
             heartbeat: now,
             device_public_key,
             is_paired: false,
+            milestone_confirmed: false,
+            milestone_deadline: 0,
+            off_peak_reward_rate_bps: 0,
         };
 
         env.storage().instance().set(&DataKey::Meter(count), &meter);
