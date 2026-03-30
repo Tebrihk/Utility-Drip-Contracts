@@ -42,6 +42,8 @@ pub struct PriceData {
 mod debt_fuzz_tests;
 #[cfg(test)]
 mod fuzz_tests;
+#[cfg(test)]
+mod insurance_pool_test;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -90,6 +92,9 @@ pub struct UsageData {
 
 mod gas_estimator;
 use gas_estimator::{GasCostEstimator, LargeScaleCostEstimate};
+
+mod insurance_pool;
+use insurance_pool::*;
 
 #[contracttype]
 #[derive(Clone)]
@@ -360,11 +365,15 @@ pub enum DataKey {
     // Task #4: Sub-DAO
     SubDaoConfig(Address),
     SoroSusuContract,
-    ActiveUserMember(Address),
-    EmergencyProposalSeq,
-    EmergencyProposal(u64),
-    EmergencyProposalApproval(u64, Address),
-    EmergencyProposalApprovalCount(u64),
+    // Insurance Pool Keys
+    InsurancePool,
+    InsurancePoolMember(Address),
+    InsuranceProposal(u64),
+    InsuranceVote(Address, u64), // user, proposal_id
+    InsuranceClaim(u64),
+    InsuranceRiskAssessment(Address),
+    InsuranceNextProposalId,
+    InsuranceNextClaimId,
 }
 
 #[contracterror]
@@ -433,12 +442,28 @@ pub enum ContractError {
     UnfairPriceIncrease = 50,
     // Issue #109
     BillingGroupNotFound = 51,
-    OracleHeartbeatHealthy = 52,
-    NotEmergencyMember = 53,
-    EmergencyProposalNotFound = 54,
-    EmergencyProposalExecuted = 55,
-    EmergencyApprovalIncomplete = 56,
-    EmergencyNoMembers = 57,
+    // Insurance Pool Errors
+    InsurancePoolNotFound = 52,
+    InsurancePoolAlreadyExists = 53,
+    NotPoolMember = 54,
+    AlreadyPoolMember = 55,
+    InsurancePoolInactive = 56,
+    MemberInactive = 57,
+    ClaimCooldownActive = 58,
+    ClaimAmountTooHigh = 59,
+    ClaimNotFound = 60,
+    ClaimAlreadyProcessed = 61,
+    InsufficientPoolFunds = 62,
+    InsufficientPremium = 63,
+    ProposalNotFound = 64,
+    VotingPeriodExpired = 65,
+    ProposalNotActive = 66,
+    VotingPeriodActive = 67,
+    QuorumNotMet = 68,
+    ProposalRejected = 69,
+    InsufficientVotingPower = 70,
+    InvalidProposalType = 71,
+    NotImplemented = 72,
 }
 
 #[contracttype]
@@ -959,6 +984,7 @@ struct ClaimSettlement {
     provider_payout: i128,
     tax_amount: i128,
     protocol_fee: i128,
+    insurance_pool_fee: i128,
 }
 
 fn settle_claim_for_meter(
@@ -1006,6 +1032,7 @@ fn settle_claim_for_meter(
         provider_payout: 0,
         tax_amount: 0,
         protocol_fee: 0,
+        insurance_pool_fee: 0,
     };
 
     if claimable > 0 {
@@ -1013,6 +1040,9 @@ fn settle_claim_for_meter(
         provider_window.daily_withdrawn = provider_window.daily_withdrawn.saturating_add(claimable);
 
         allocate_to_maintenance_fund(env, meter_id, claimable);
+
+        // Allocate fees to insurance pool if it exists
+        let insurance_pool_fee = allocate_claim_fees_to_pool(env, claimable);
 
         let tax_rate_bps = get_tax_rate_or_default(env);
         let (tax_amount, after_tax_amount) = calculate_tax_split(claimable, tax_rate_bps);
@@ -1049,6 +1079,7 @@ fn settle_claim_for_meter(
             provider_payout,
             tax_amount,
             protocol_fee,
+            insurance_pool_fee,
         };
     } else if !same_hour {
         meter.claimed_this_hour = 0;
@@ -1482,7 +1513,7 @@ impl UtilityContract {
             token,
             billing_type,
             device_public_key,
-            0,
+            priority_index,
         )
     }
 
@@ -1948,19 +1979,6 @@ impl UtilityContract {
                     &gov_vault,
                     &settlement.tax_amount,
                 );
-
-                let tax_rate_bps = get_tax_rate_or_default(&env);
-                let tax_receipt = TaxReceipt {
-                    meter_id,
-                    total_amount: settlement.gross_claimed,
-                    tax_amount: settlement.tax_amount,
-                    net_amount: settlement.provider_payout + settlement.protocol_fee,
-                    tax_rate_bps,
-                    government_vault: gov_vault,
-                    timestamp: now,
-                };
-                env.events()
-                    .publish((soroban_sdk::symbol_short!("TaxRcpt"), meter_id), tax_receipt);
             }
         }
 
@@ -4305,6 +4323,98 @@ impl UtilityContract {
             (symbol_short!("MstoneConf"), meter_id),
             env.ledger().timestamp(),
         );
+    }
+
+    // ============================================================================
+    // INSURANCE POOL GOVERNANCE METHODS
+    // ============================================================================
+
+    /// Create a new insurance pool for community mutual aid
+    pub fn create_insurance_pool(
+        env: Env,
+        governance_admin: Address,
+        base_premium_rate_bps: i128,
+    ) -> Result<(), ContractError> {
+        create_insurance_pool(&env, governance_admin, base_premium_rate_bps)
+    }
+
+    /// Join the insurance pool by paying premium
+    pub fn join_insurance_pool(
+        env: Env,
+        user: Address,
+        meter_id: u64,
+        premium_amount: i128,
+    ) -> Result<(), ContractError> {
+        join_insurance_pool(&env, user, meter_id, premium_amount)
+    }
+
+    /// Submit a claim to the insurance pool for emergency funding
+    pub fn submit_insurance_claim(
+        env: Env,
+        claimant: Address,
+        meter_id: u64,
+        requested_amount: i128,
+        reason: Symbol,
+    ) -> Result<u64, ContractError> {
+        submit_insurance_claim(&env, claimant, meter_id, requested_amount, reason)
+    }
+
+    /// Create a governance proposal for pool parameters
+    pub fn create_governance_proposal(
+        env: Env,
+        proposer: Address,
+        proposal_type: ProposalType,
+        description: Symbol,
+        new_value: i128,
+    ) -> Result<u64, ContractError> {
+        create_governance_proposal(&env, proposer, proposal_type, description, new_value)
+    }
+
+    /// Vote on a governance proposal
+    pub fn vote_on_proposal(
+        env: Env,
+        voter: Address,
+        proposal_id: u64,
+        vote_for: bool,
+    ) -> Result<(), ContractError> {
+        vote_on_proposal(&env, voter, proposal_id, vote_for)
+    }
+
+    /// Execute a passed governance proposal
+    pub fn execute_proposal(env: Env, proposal_id: u64) -> Result<(), ContractError> {
+        execute_proposal(&env, proposal_id)
+    }
+
+    /// Get insurance pool information
+    pub fn get_insurance_pool(env: Env) -> Result<InsurancePool, ContractError> {
+        get_insurance_pool(&env)
+    }
+
+    /// Get pool member information
+    pub fn get_pool_member(env: Env, user: Address) -> Result<InsurancePoolMember, ContractError> {
+        get_pool_member(&env, &user)
+    }
+
+    /// Calculate premium amount for a user/meter
+    pub fn calculate_premium_amount(
+        env: Env,
+        user: Address,
+        meter_id: u64,
+    ) -> Result<i128, ContractError> {
+        calculate_premium_amount(&env, &user, meter_id)
+    }
+
+    /// Get risk assessment for a user
+    pub fn get_risk_assessment(env: Env, user: Address) -> Result<RiskAssessment, ContractError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::InsuranceRiskAssessment(user))
+            .ok_or(ContractError::NotPoolMember)
+    }
+
+    /// Process an approved insurance claim
+    pub fn process_approved_claim(env: Env, claim_id: u64) -> Result<(), ContractError> {
+        process_approved_claim(&env, claim_id)
     }
 }
 
