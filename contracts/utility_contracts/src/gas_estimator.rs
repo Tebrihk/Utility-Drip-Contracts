@@ -1,4 +1,4 @@
-use soroban_sdk::{Env, Address};
+use soroban_sdk::{Address, Env};
 
 pub struct GasCostEstimator;
 
@@ -22,7 +22,7 @@ impl GasCostEstimator {
         meters_in_group: u32,
     ) -> i128 {
         let mut monthly_cost = Self::REGISTER_METER; // One-time registration
-        
+
         // Add recurring costs
         monthly_cost += (Self::CLAIM as u32 * Self::CLAIMS_PER_MONTH) as i128;
         monthly_cost += (Self::UPDATE_HEARTBEAT as u32 * Self::HEARTBEATS_PER_MONTH) as i128;
@@ -57,7 +57,8 @@ impl GasCostEstimator {
             0
         };
 
-        let individual_cost = Self::estimate_meter_monthly_cost(_env, false, 0) * individual_meters as i128;
+        let individual_cost =
+            Self::estimate_meter_monthly_cost(_env, false, 0) * individual_meters as i128;
 
         group_cost + individual_cost
     }
@@ -68,11 +69,12 @@ impl GasCostEstimator {
         group_billing_enabled: bool,
     ) -> LargeScaleCostEstimate {
         let percentage_group = if group_billing_enabled { 0.8 } else { 0.0 }; // 80% in groups if enabled
-        let monthly_cost = Self::estimate_provider_monthly_cost(env, number_of_meters, percentage_group);
-        
+        let monthly_cost =
+            Self::estimate_provider_monthly_cost(env, number_of_meters, percentage_group);
+
         let annual_cost = monthly_cost * 12;
         let cost_per_meter = monthly_cost / number_of_meters as i128;
-        
+
         // Convert to XLM (1 XLM = 10,000,000 stroops)
         let monthly_xlm = monthly_cost / 10_000_000;
         let annual_xlm = annual_cost / 10_000_000;
@@ -128,7 +130,11 @@ impl LargeScaleCostEstimate {
             self.cost_per_meter_xlm,
             self.annual_cost_xlm,
             self.cost_per_meter_xlm,
-            if self.group_billing_enabled { "Enabled" } else { "Disabled" }
+            if self.group_billing_enabled {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
         )
     }
 }
