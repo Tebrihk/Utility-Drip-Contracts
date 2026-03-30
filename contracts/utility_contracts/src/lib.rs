@@ -4619,5 +4619,4 @@ fn verify_usage_signature(
     );
     Ok(())
 }
-
 mod test;
