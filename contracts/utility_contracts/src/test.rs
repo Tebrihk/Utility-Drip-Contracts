@@ -3,7 +3,73 @@
 
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
-use soroban_sdk::{token, Address, BytesN, Env, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, panic_with_error, token, Address, BytesN, Env, Vec};
+
+#[contracttype]
+#[derive(Clone)]
+enum OracleDataKey {
+    Price,
+}
+
+#[contract]
+struct MockOracle;
+
+#[contractimpl]
+impl MockOracle {
+    fn set_price(env: Env, price: i128, decimals: u32, last_updated: u64) {
+        let data = PriceData {
+            price,
+            decimals,
+            last_updated,
+        };
+        env.storage().instance().set(&OracleDataKey::Price, &data);
+    }
+
+    fn get_price(env: Env) -> PriceData {
+        env.storage()
+            .instance()
+            .get(&OracleDataKey::Price)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::OracleNotSet))
+    }
+
+    fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128 {
+        let price = Self::get_price(env).price;
+        xlm_amount.saturating_mul(price)
+    }
+
+    fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128 {
+        let price = Self::get_price(env).price;
+        if price <= 0 {
+            0
+        } else {
+            usd_cents / price
+        }
+    }
+}
+
+fn setup_meter_and_oracle(env: &Env, stale: bool) -> (UtilityContractClient<'_>, Address, u64, Address) {
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(env, &contract_id);
+
+    let user = Address::generate(env);
+    let provider = Address::generate(env);
+    let token_address = create_token(env);
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &device_key(env, 3));
+
+    let oracle_id = env.register_contract(None, MockOracle);
+    let oracle_client = MockOracleClient::new(env, &oracle_id);
+    client.set_oracle(&oracle_id);
+
+    let now = env.ledger().timestamp();
+    let heartbeat = if stale {
+        now.saturating_sub(72 * 60 * 60 + 1)
+    } else {
+        now.saturating_sub(60)
+    };
+    oracle_client.set_price(&100, &2, &heartbeat);
+
+    (client, token_address, meter_id, user)
+}
 
 fn device_key(env: &Env, byte: u8) -> BytesN<32> {
     BytesN::from_array(env, &[byte; 32])
@@ -195,4 +261,162 @@ fn test_batch_register_meters_empty_vector_panics() {
     let empty = Vec::<MeterInfo>::new(&env);
 
     client.batch_register_meters(&empty);
+}
+
+#[test]
+fn test_trust_mode_boundary_72_hours() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let contract_id = env.register_contract(None, UtilityContract);
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let oracle_id = env.register_contract(None, MockOracle);
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+    client.set_oracle(&oracle_id);
+
+    let now = env.ledger().timestamp();
+    oracle_client.set_price(&100, &2, &(now - 72 * 60 * 60));
+    assert!(!client.is_trust_mode());
+
+    oracle_client.set_price(&100, &2, &(now - 72 * 60 * 60 - 1));
+    assert!(client.is_trust_mode());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_healthy_oracle_blocks_emergency_proposal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member) = setup_meter_and_oracle(&env, false);
+    client.register_active_user(&member);
+
+    client.propose_emergency_flow_rate(&member, &meter_id, &9999);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #56)")]
+fn test_unanimous_approval_required_before_execute() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    let member_two = Address::generate(&env);
+
+    client.register_active_user(&member_one);
+    client.register_active_user(&member_two);
+
+    let proposal_id = client.propose_emergency_flow_rate(&member_one, &meter_id, &7777);
+    client.execute_emergency_action(&member_one, &proposal_id);
+}
+
+#[test]
+fn test_emergency_flow_rate_executes_after_unanimous_vote() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    let member_two = Address::generate(&env);
+
+    client.register_active_user(&member_one);
+    client.register_active_user(&member_two);
+
+    let proposal_id = client.propose_emergency_flow_rate(&member_one, &meter_id, &8888);
+    client.approve_emergency_action(&member_two, &proposal_id);
+    client.execute_emergency_action(&member_one, &proposal_id);
+
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.max_flow_rate_per_hour, 8888);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #53)")]
+fn test_non_member_cannot_propose_emergency_action() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, _registered_member) = setup_meter_and_oracle(&env, true);
+    let non_member = Address::generate(&env);
+
+    client.propose_emergency_pause(&non_member, &meter_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #17)")]
+fn test_duplicate_emergency_vote_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    let member_two = Address::generate(&env);
+    client.register_active_user(&member_one);
+    client.register_active_user(&member_two);
+
+    let proposal_id = client.propose_emergency_pause(&member_one, &meter_id);
+    client.approve_emergency_action(&member_two, &proposal_id);
+    client.approve_emergency_action(&member_two, &proposal_id);
+}
+
+#[test]
+fn test_emergency_pause_executes_after_unanimous_vote() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    let member_two = Address::generate(&env);
+
+    client.register_active_user(&member_one);
+    client.register_active_user(&member_two);
+
+    let proposal_id = client.propose_emergency_pause(&member_one, &meter_id);
+    client.approve_emergency_action(&member_two, &proposal_id);
+    client.execute_emergency_action(&member_one, &proposal_id);
+
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert!(meter.is_paused);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #52)")]
+fn test_oracle_recovery_blocks_new_emergency_actions() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    client.register_active_user(&member_one);
+
+    let oracle_addr = client.get_current_rate();
+    assert!(oracle_addr.is_some());
+
+    let oracle_id = env.register_contract(None, MockOracle);
+    let oracle_client = MockOracleClient::new(&env, &oracle_id);
+    client.set_oracle(&oracle_id);
+    oracle_client.set_price(&100, &2, &env.ledger().timestamp());
+
+    client.propose_emergency_pause(&member_one, &meter_id);
+}
+
+#[test]
+fn test_single_member_unanimity_allows_execution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+
+    let (client, _token, meter_id, member_one) = setup_meter_and_oracle(&env, true);
+    client.register_active_user(&member_one);
+
+    let proposal_id = client.propose_emergency_flow_rate(&member_one, &meter_id, &4242);
+    client.execute_emergency_action(&member_one, &proposal_id);
+
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.max_flow_rate_per_hour, 4242);
 }

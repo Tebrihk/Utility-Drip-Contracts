@@ -232,6 +232,24 @@ pub struct AdminTransferProposal {
     pub is_active: bool,
 }
 
+#[contracttype]
+#[derive(Clone)]
+pub enum EmergencyAction {
+    SetFlowRate(i128),
+    PauseCycle,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencyProposal {
+    pub proposal_id: u64,
+    pub meter_id: u64,
+    pub action: EmergencyAction,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub executed: bool,
+}
+
 pub fn set_sorosusu_contract(env: Env, addr: Address) {
     env.storage()
         .instance()
@@ -342,6 +360,11 @@ pub enum DataKey {
     // Task #4: Sub-DAO
     SubDaoConfig(Address),
     SoroSusuContract,
+    ActiveUserMember(Address),
+    EmergencyProposalSeq,
+    EmergencyProposal(u64),
+    EmergencyProposalApproval(u64, Address),
+    EmergencyProposalApprovalCount(u64),
 }
 
 #[contracterror]
@@ -410,6 +433,12 @@ pub enum ContractError {
     UnfairPriceIncrease = 50,
     // Issue #109
     BillingGroupNotFound = 51,
+    OracleHeartbeatHealthy = 52,
+    NotEmergencyMember = 53,
+    EmergencyProposalNotFound = 54,
+    EmergencyProposalExecuted = 55,
+    EmergencyApprovalIncomplete = 56,
+    EmergencyNoMembers = 57,
 }
 
 #[contracttype]
@@ -466,6 +495,7 @@ const LEDGER_LIFETIME_EXTENSION: u32 = 1_000_000; // Extend by 1M ledgers
 
 // Task #4: Wasm Hash Rotation Constants
 const UPGRADE_VETO_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS; // 7 days veto period
+const ORACLE_HEARTBEAT_TIMEOUT_SECONDS: u64 = 72 * HOUR_IN_SECONDS;
 
 /// Round XLM amount to nearest minimum increment (0.0000001 XLM)
 /// This prevents value loss over time due to truncation
@@ -576,6 +606,67 @@ fn get_oracle_or_panic(env: &Env) -> Address {
         Some(oracle) => oracle,
         None => panic_with_error!(env, ContractError::OracleNotSet),
     }
+}
+
+fn is_trust_mode_active(env: &Env) -> bool {
+    let now = env.ledger().timestamp();
+    match env
+        .storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Oracle)
+    {
+        Some(oracle_address) => {
+            let oracle_client = PriceOracleClient::new(env, &oracle_address);
+            let price_data = oracle_client.get_price();
+            now.saturating_sub(price_data.last_updated) > ORACLE_HEARTBEAT_TIMEOUT_SECONDS
+        }
+        None => true,
+    }
+}
+
+fn require_trust_mode(env: &Env) {
+    if !is_trust_mode_active(env) {
+        panic_with_error!(env, ContractError::OracleHeartbeatHealthy);
+    }
+}
+
+fn active_member_count(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get::<DataKey, u32>(&DataKey::ActiveUsers)
+        .unwrap_or(0)
+}
+
+fn require_emergency_member(env: &Env, member: &Address) {
+    member.require_auth();
+    let is_member = env
+        .storage()
+        .instance()
+        .get::<DataKey, bool>(&DataKey::ActiveUserMember(member.clone()))
+        .unwrap_or(false);
+    if !is_member {
+        panic_with_error!(env, ContractError::NotEmergencyMember);
+    }
+}
+
+fn next_emergency_proposal_id(env: &Env) -> u64 {
+    let current = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::EmergencyProposalSeq)
+        .unwrap_or(0);
+    let next = current.saturating_add(1);
+    env.storage()
+        .instance()
+        .set(&DataKey::EmergencyProposalSeq, &next);
+    next
+}
+
+fn get_emergency_proposal_or_panic(env: &Env, proposal_id: u64) -> EmergencyProposal {
+    env.storage()
+        .instance()
+        .get::<DataKey, EmergencyProposal>(&DataKey::EmergencyProposal(proposal_id))
+        .unwrap_or_else(|| panic_with_error!(env, ContractError::EmergencyProposalNotFound))
 }
 
 fn convert_xlm_to_usd_if_needed(
@@ -1391,31 +1482,8 @@ impl UtilityContract {
             token,
             billing_type,
             device_public_key,
-            is_paired: false,
-            grace_period_start: 0,
-            is_paused: false,
-            tier_threshold: 0,
-            tier_rate: 0,
-            is_disputed: false,
-            challenge_timestamp: 0,
-            credit_drip_rate: 0,
-            is_closed: false,
-            priority_index, // Task #1: Set priority index
-            off_peak_reward_rate_bps: 0,
-            milestone_deadline: 0,
-            milestone_confirmed: true,
-        };
-
-        env.storage().instance().set(&DataKey::Meter(count), &meter);
-        env.storage().instance().set(&DataKey::Count, &count);
-
-        // Initialize provider total pool (new meter starts with 0 value)
-        let current_pool = get_provider_total_pool_impl(&env, &provider);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProviderTotalPool(provider), &current_pool);
-
-        count
+            0,
+        )
     }
 
     pub fn batch_register_meters(env: Env, meter_infos: Vec<MeterInfo>) -> BatchCreatedEvent {
@@ -1882,123 +1950,19 @@ impl UtilityContract {
                 );
 
                 let tax_rate_bps = get_tax_rate_or_default(&env);
-                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
-                
-                if tax_amount > 0 {
-                    // Transfer tax to government vault if configured
-                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
-                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
-                        
-                        // Emit TaxReceipt event
-                        let tax_receipt = TaxReceipt {
-                            meter_id,
-                            total_amount: claimable,
-                            tax_amount,
-                            net_amount: after_tax_amount,
-                            tax_rate_bps,
-                            government_vault: gov_vault.clone(),
-                            timestamp: now,
-                        };
-                        env.events().publish(
-                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
-                            tax_receipt,
-                        );
-                    }
-                }
-                
-                payout = after_tax_amount;
-
-                // Protocol fee (existing logic)
-                if let Some(wallet) = env
-                    .storage()
-                    .instance()
-                    .get::<_, Address>(&DataKey::MaintenanceWallet)
-                {
-                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
-                    let fee = (payout * fee_bps) / 10000;
-                    payout -= fee;
-                    if fee > 0 {
-                        client.transfer(&env.current_contract_address(), &wallet, &fee);
-                    }
-                }
-                if payout > 0 {
-                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
-                }
-                meter.balance -= claimable;
-                meter.claimed_this_hour += claimable;
-                
-                // If credit drip was active, reduce the debt if in PostPaid mode
-                if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
-                    let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
-                    meter.debt = meter.debt.saturating_sub(credit_settlement);
-                }
+                let tax_receipt = TaxReceipt {
+                    meter_id,
+                    total_amount: settlement.gross_claimed,
+                    tax_amount: settlement.tax_amount,
+                    net_amount: settlement.provider_payout + settlement.protocol_fee,
+                    tax_rate_bps,
+                    government_vault: gov_vault,
+                    timestamp: now,
+                };
+                env.events()
+                    .publish((soroban_sdk::symbol_short!("TaxRcpt"), meter_id), tax_receipt);
             }
-        } else {
-            // New hour, reset claimed_this_hour
-            meter.claimed_this_hour = 0;
-
-            // Ensure we don't exceed debt threshold
-            let claimable = if amount > meter.balance && meter.balance - amount >= DEBT_THRESHOLD {
-                amount
-            } else if amount > meter.balance {
-                meter.balance - DEBT_THRESHOLD // Allow going down to threshold
-            } else {
-                amount
-            };
-
-            if claimable > 0 {
-                let client = token::Client::new(&env, &meter.token);
-                let mut payout = claimable;
-
-                // Task #3: Allocate to maintenance fund (0.01% = 1 basis point)
-                allocate_to_maintenance_fund(&env, meter_id, claimable);
-
-                // Task #2: Tax Compliance - Split tax before provider payout
-                let tax_rate_bps = get_tax_rate_or_default(&env);
-                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
-                
-                if tax_amount > 0 {
-                    // Transfer tax to government vault if configured
-                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
-                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
-                        
-                        // Emit TaxReceipt event
-                        let tax_receipt = TaxReceipt {
-                            meter_id,
-                            total_amount: claimable,
-                            tax_amount,
-                            net_amount: after_tax_amount,
-                            tax_rate_bps,
-                            government_vault: gov_vault.clone(),
-                            timestamp: now,
-                        };
-                        env.events().publish(
-                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
-                            tax_receipt,
-                        );
-                    }
-                }
-                
-                payout = after_tax_amount;
-
-                // Protocol fee (existing logic)
-                if let Some(wallet) = env
-                    .storage()
-                    .instance()
-                    .get::<_, Address>(&DataKey::MaintenanceWallet)
-                {
-                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
-                    let fee = (payout * fee_bps) / 10000;
-                    payout -= fee;
-                    if fee > 0 {
-                        client.transfer(&env.current_contract_address(), &wallet, &fee);
-                    }
-                }
-                if payout > 0 {
-                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
-                }
-                meter.balance -= claimable;
-                meter.claimed_this_hour = claimable;
+        }
 
         if settlement.protocol_fee > 0 {
             if let Some(wallet) = env
@@ -2162,6 +2126,193 @@ impl UtilityContract {
 
         env.events()
             .publish((symbol_short!("Paused"), meter_id), paused);
+    }
+
+    pub fn is_trust_mode(env: Env) -> bool {
+        is_trust_mode_active(&env)
+    }
+
+    pub fn propose_emergency_flow_rate(
+        env: Env,
+        member: Address,
+        meter_id: u64,
+        max_rate_per_hour: i128,
+    ) -> u64 {
+        require_trust_mode(&env);
+        require_emergency_member(&env, &member);
+        if active_member_count(&env) == 0 {
+            panic_with_error!(&env, ContractError::EmergencyNoMembers);
+        }
+        if max_rate_per_hour <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+
+        // Ensure the target meter exists before proposal creation.
+        let _meter = get_meter_or_panic(&env, meter_id);
+        let proposal_id = next_emergency_proposal_id(&env);
+        let proposal = EmergencyProposal {
+            proposal_id,
+            meter_id,
+            action: EmergencyAction::SetFlowRate(max_rate_per_hour),
+            proposed_by: member.clone(),
+            proposed_at: env.ledger().timestamp(),
+            executed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposal(proposal_id), &proposal);
+        env.storage().instance().set(
+            &DataKey::EmergencyProposalApproval(proposal_id, member),
+            &true,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposalApprovalCount(proposal_id), &1u32);
+
+        env.events().publish(
+            (symbol_short!("EmgProp"), proposal_id),
+            (meter_id, env.ledger().timestamp()),
+        );
+
+        proposal_id
+    }
+
+    pub fn propose_emergency_pause(env: Env, member: Address, meter_id: u64) -> u64 {
+        require_trust_mode(&env);
+        require_emergency_member(&env, &member);
+        if active_member_count(&env) == 0 {
+            panic_with_error!(&env, ContractError::EmergencyNoMembers);
+        }
+
+        // Ensure the target meter exists before proposal creation.
+        let _meter = get_meter_or_panic(&env, meter_id);
+        let proposal_id = next_emergency_proposal_id(&env);
+        let proposal = EmergencyProposal {
+            proposal_id,
+            meter_id,
+            action: EmergencyAction::PauseCycle,
+            proposed_by: member.clone(),
+            proposed_at: env.ledger().timestamp(),
+            executed: false,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposal(proposal_id), &proposal);
+        env.storage().instance().set(
+            &DataKey::EmergencyProposalApproval(proposal_id, member),
+            &true,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposalApprovalCount(proposal_id), &1u32);
+
+        env.events().publish(
+            (symbol_short!("EmgProp"), proposal_id),
+            (meter_id, env.ledger().timestamp()),
+        );
+
+        proposal_id
+    }
+
+    pub fn approve_emergency_action(env: Env, member: Address, proposal_id: u64) {
+        require_trust_mode(&env);
+        require_emergency_member(&env, &member);
+        if active_member_count(&env) == 0 {
+            panic_with_error!(&env, ContractError::EmergencyNoMembers);
+        }
+
+        let proposal = get_emergency_proposal_or_panic(&env, proposal_id);
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::EmergencyProposalExecuted);
+        }
+
+        if env.storage().instance().has(&DataKey::EmergencyProposalApproval(
+            proposal_id,
+            member.clone(),
+        )) {
+            panic_with_error!(&env, ContractError::AlreadyVoted);
+        }
+
+        env.storage().instance().set(
+            &DataKey::EmergencyProposalApproval(proposal_id, member),
+            &true,
+        );
+
+        let approvals = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::EmergencyProposalApprovalCount(proposal_id))
+            .unwrap_or(0)
+            .saturating_add(1);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposalApprovalCount(proposal_id), &approvals);
+
+        env.events().publish(
+            (symbol_short!("EmgAppr"), proposal_id),
+            approvals,
+        );
+    }
+
+    pub fn execute_emergency_action(env: Env, member: Address, proposal_id: u64) {
+        require_trust_mode(&env);
+        require_emergency_member(&env, &member);
+
+        let total_members = active_member_count(&env);
+        if total_members == 0 {
+            panic_with_error!(&env, ContractError::EmergencyNoMembers);
+        }
+
+        let mut proposal = get_emergency_proposal_or_panic(&env, proposal_id);
+        if proposal.executed {
+            panic_with_error!(&env, ContractError::EmergencyProposalExecuted);
+        }
+
+        let approvals = env
+            .storage()
+            .instance()
+            .get::<DataKey, u32>(&DataKey::EmergencyProposalApprovalCount(proposal_id))
+            .unwrap_or(0);
+        if approvals != total_members {
+            panic_with_error!(&env, ContractError::EmergencyApprovalIncomplete);
+        }
+
+        let mut meter = get_meter_or_panic(&env, proposal.meter_id);
+        match proposal.action {
+            EmergencyAction::SetFlowRate(rate) => {
+                if rate <= 0 {
+                    panic_with_error!(&env, ContractError::InvalidTokenAmount);
+                }
+                meter.max_flow_rate_per_hour = rate;
+            }
+            EmergencyAction::PauseCycle => {
+                meter.is_paused = true;
+                let now = env.ledger().timestamp();
+                refresh_activity(&mut meter, now);
+            }
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Meter(proposal.meter_id), &meter);
+
+        proposal.executed = true;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (symbol_short!("EmgExec"), proposal_id),
+            proposal.meter_id,
+        );
+    }
+
+    pub fn get_emergency_proposal(env: Env, proposal_id: u64) -> Option<EmergencyProposal> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyProposal(proposal_id))
     }
 
     pub fn set_tiered_pricing(env: Env, meter_id: u64, threshold: i128, rate: i128) {
@@ -3606,15 +3757,26 @@ impl UtilityContract {
     pub fn register_active_user(env: Env, user: Address) {
         user.require_auth();
 
-        // Simplified: just increment counter
-        let count: u32 = env
+        // Track members uniquely so unanimous emergency approvals are exact.
+        let already_member = env
             .storage()
             .instance()
-            .get(&DataKey::ActiveUsers)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::ActiveUsers, &(count + 1));
+            .get::<DataKey, bool>(&DataKey::ActiveUserMember(user.clone()))
+            .unwrap_or(false);
+
+        if !already_member {
+            let count: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::ActiveUsers)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::ActiveUsers, &(count + 1));
+            env.storage()
+                .instance()
+                .set(&DataKey::ActiveUserMember(user.clone()), &true);
+        }
 
         env.events()
             .publish((soroban_sdk::symbol_short!("ActvUser"),), user);
