@@ -130,10 +130,6 @@ pub struct Meter {
     // Issue #106: Milestones
     pub milestone_deadline: u64,
     pub milestone_confirmed: bool,
-    // Community Handshake: Infrastructure project final release
-    pub community_handshake_enabled: bool,
-    pub total_deposited: i128,
-    pub handshake_released: bool,
 }
 
 #[contracttype]
@@ -212,18 +208,6 @@ pub struct BatchWithdrawResult {
     pub total_provider_payout: i128,
     pub total_tax_withheld: i128,
     pub total_protocol_fee: i128,
-}
-
-// Community Handshake: Tracks vote state for final fund release
-#[contracttype]
-#[derive(Clone)]
-pub struct CommunityHandshake {
-    pub meter_id: u64,
-    pub locked_amount: i128,
-    pub votes_for: u32,
-    pub votes_required: u32,
-    pub is_released: bool,
-    pub created_at: u64,
 }
 
 // Task #4: Upgrade Proposal Event
@@ -358,9 +342,6 @@ pub enum DataKey {
     // Task #4: Sub-DAO
     SubDaoConfig(Address),
     SoroSusuContract,
-    // Community Handshake
-    CommunityHandshake(u64),
-    HandshakeVoter(u64, Address),
 }
 
 #[contracterror]
@@ -429,12 +410,6 @@ pub enum ContractError {
     UnfairPriceIncrease = 50,
     // Issue #109
     BillingGroupNotFound = 51,
-    // Community Handshake Errors
-    HandshakeNotEnabled = 52,
-    HandshakeAlreadyReleased = 53,
-    HandshakeVoteFailed = 54,
-    HandshakeAlreadyVoted = 55,
-    StreamStillActive = 56,
 }
 
 #[contracttype]
@@ -491,10 +466,6 @@ const LEDGER_LIFETIME_EXTENSION: u32 = 1_000_000; // Extend by 1M ledgers
 
 // Task #4: Wasm Hash Rotation Constants
 const UPGRADE_VETO_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS; // 7 days veto period
-
-// Community Handshake Constants
-const HANDSHAKE_LOCK_PERCENT: i128 = 10; // 10% of total deposited funds
-const HANDSHAKE_DEFAULT_VOTES_REQUIRED: u32 = 3; // Default quorum for final release
 
 /// Round XLM amount to nearest minimum increment (0.0000001 XLM)
 /// This prevents value loss over time due to truncation
@@ -939,16 +910,6 @@ fn settle_claim_for_meter(
         amount
     };
 
-    // Community Handshake: cap claimable so the locked 10% stays in the contract
-    let claimable = if meter.community_handshake_enabled && !meter.handshake_released {
-        let locked = (meter.total_deposited * HANDSHAKE_LOCK_PERCENT) / 100;
-        let min_balance = locked;
-        let available = meter.balance.saturating_sub(min_balance).max(0);
-        claimable.min(available)
-    } else {
-        claimable
-    };
-
     let mut settlement = ClaimSettlement {
         gross_claimed: 0,
         provider_payout: 0,
@@ -1075,12 +1036,6 @@ fn register_meter_internal(
         credit_drip_rate: 0,
         is_closed: false,
         priority_index,
-        community_handshake_enabled: false,
-        total_deposited: 0,
-        handshake_released: false,
-        off_peak_reward_rate_bps: 0,
-        milestone_deadline: 0,
-        milestone_confirmed: true,
     };
 
     env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1515,12 +1470,6 @@ impl UtilityContract {
                 credit_drip_rate: 0,
                 is_closed: false,
                 priority_index: 0,
-                community_handshake_enabled: false,
-                total_deposited: 0,
-                handshake_released: false,
-                off_peak_reward_rate_bps: 0,
-                milestone_deadline: 0,
-                milestone_confirmed: true,
             };
 
             env.storage().instance().set(&DataKey::Meter(count), &meter);
@@ -1648,9 +1597,6 @@ impl UtilityContract {
 
         let now = env.ledger().timestamp();
         refresh_activity(&mut meter, now);
-
-        // Track total deposited for community handshake calculation
-        meter.total_deposited = meter.total_deposited.saturating_add(converted_amount);
 
         if !was_active && meter.is_active {
             meter.last_update = now;
@@ -1910,8 +1856,125 @@ impl UtilityContract {
                     &gov_vault,
                     &settlement.tax_amount,
                 );
+
+                let tax_rate_bps = get_tax_rate_or_default(&env);
+                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
+                
+                if tax_amount > 0 {
+                    // Transfer tax to government vault if configured
+                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
+                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
+                        
+                        // Emit TaxReceipt event
+                        let tax_receipt = TaxReceipt {
+                            meter_id,
+                            total_amount: claimable,
+                            tax_amount,
+                            net_amount: after_tax_amount,
+                            tax_rate_bps,
+                            government_vault: gov_vault.clone(),
+                            timestamp: now,
+                        };
+                        env.events().publish(
+                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
+                            tax_receipt,
+                        );
+                    }
+                }
+                
+                payout = after_tax_amount;
+
+                // Protocol fee (existing logic)
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
+                    let fee = (payout * fee_bps) / 10000;
+                    payout -= fee;
+                    if fee > 0 {
+                        client.transfer(&env.current_contract_address(), &wallet, &fee);
+                    }
+                }
+                if payout > 0 {
+                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
+                }
+                meter.balance -= claimable;
+                meter.claimed_this_hour += claimable;
+                
+                // If credit drip was active, reduce the debt if in PostPaid mode
+                if meter.billing_type == BillingType::PostPaid && meter.credit_drip_rate > 0 {
+                    let credit_settlement = (elapsed as i128).saturating_mul(meter.credit_drip_rate).min(meter.debt);
+                    meter.debt = meter.debt.saturating_sub(credit_settlement);
+                }
             }
-        }
+        } else {
+            // New hour, reset claimed_this_hour
+            meter.claimed_this_hour = 0;
+
+            // Ensure we don't exceed debt threshold
+            let claimable = if amount > meter.balance && meter.balance - amount >= DEBT_THRESHOLD {
+                amount
+            } else if amount > meter.balance {
+                meter.balance - DEBT_THRESHOLD // Allow going down to threshold
+            } else {
+                amount
+            };
+
+            if claimable > 0 {
+                let client = token::Client::new(&env, &meter.token);
+                let mut payout = claimable;
+
+                // Task #3: Allocate to maintenance fund (0.01% = 1 basis point)
+                allocate_to_maintenance_fund(&env, meter_id, claimable);
+
+                // Task #2: Tax Compliance - Split tax before provider payout
+                let tax_rate_bps = get_tax_rate_or_default(&env);
+                let (tax_amount, after_tax_amount) = calculate_tax_split(payout, tax_rate_bps);
+                
+                if tax_amount > 0 {
+                    // Transfer tax to government vault if configured
+                    if let Some(gov_vault) = get_government_vault_or_default(&env) {
+                        client.transfer(&env.current_contract_address(), &gov_vault, &tax_amount);
+                        
+                        // Emit TaxReceipt event
+                        let tax_receipt = TaxReceipt {
+                            meter_id,
+                            total_amount: claimable,
+                            tax_amount,
+                            net_amount: after_tax_amount,
+                            tax_rate_bps,
+                            government_vault: gov_vault.clone(),
+                            timestamp: now,
+                        };
+                        env.events().publish(
+                            (soroban_sdk::symbol_short!("TaxRcpt"), meter_id),
+                            tax_receipt,
+                        );
+                    }
+                }
+                
+                payout = after_tax_amount;
+
+                // Protocol fee (existing logic)
+                if let Some(wallet) = env
+                    .storage()
+                    .instance()
+                    .get::<_, Address>(&DataKey::MaintenanceWallet)
+                {
+                    let fee_bps = get_platform_fee_bps_impl(&env, &meter.user);
+                    let fee = (payout * fee_bps) / 10000;
+                    payout -= fee;
+                    if fee > 0 {
+                        client.transfer(&env.current_contract_address(), &wallet, &fee);
+                    }
+                }
+                if payout > 0 {
+                    client.transfer(&env.current_contract_address(), &meter.provider, &payout);
+                }
+                meter.balance -= claimable;
+                meter.claimed_this_hour = claimable;
 
         if settlement.protocol_fee > 0 {
             if let Some(wallet) = env
@@ -2177,17 +2240,6 @@ impl UtilityContract {
 
         if amount_usd_cents > available_earnings {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
-        }
-
-        // Community Handshake: prevent withdrawing the locked 10%
-        if meter.community_handshake_enabled && !meter.handshake_released {
-            let locked = (meter.total_deposited * HANDSHAKE_LOCK_PERCENT) / 100;
-            if meter.billing_type == BillingType::PrePaid {
-                let available_after = meter.balance.saturating_sub(amount_usd_cents);
-                if available_after < locked {
-                    panic_with_error!(&env, ContractError::InsufficientBalance);
-                }
-            }
         }
 
         // Convert USD cents to XLM if needed
@@ -4067,182 +4119,6 @@ impl UtilityContract {
             (symbol_short!("MstoneConf"), meter_id),
             env.ledger().timestamp(),
         );
-    }
-
-    // ── Community Handshake: Infrastructure Project Final Release ────
-
-    /// Enable the community handshake on a meter (infrastructure project).
-    /// The last 10% of total deposited funds will be locked until a community
-    /// vote passes. Only the meter user can enable this.
-    pub fn enable_community_handshake(
-        env: Env,
-        meter_id: u64,
-        votes_required: u32,
-    ) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-
-        let quorum = if votes_required == 0 {
-            HANDSHAKE_DEFAULT_VOTES_REQUIRED
-        } else {
-            votes_required
-        };
-
-        meter.community_handshake_enabled = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
-
-        let handshake = CommunityHandshake {
-            meter_id,
-            locked_amount: 0, // Will be calculated dynamically
-            votes_for: 0,
-            votes_required: quorum,
-            is_released: false,
-            created_at: env.ledger().timestamp(),
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::CommunityHandshake(meter_id), &handshake);
-
-        env.events().publish(
-            (symbol_short!("HndshkOn"), meter_id),
-            quorum,
-        );
-    }
-
-    /// Vote to approve the final release of locked funds.
-    /// Any address can vote; each address may only vote once per meter.
-    pub fn vote_final_release(env: Env, meter_id: u64, voter: Address) {
-        voter.require_auth();
-
-        let meter = get_meter_or_panic(&env, meter_id);
-        if !meter.community_handshake_enabled {
-            panic_with_error!(&env, ContractError::HandshakeNotEnabled);
-        }
-
-        let mut handshake: CommunityHandshake = env
-            .storage()
-            .instance()
-            .get(&DataKey::CommunityHandshake(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::HandshakeNotEnabled));
-
-        if handshake.is_released {
-            panic_with_error!(&env, ContractError::HandshakeAlreadyReleased);
-        }
-
-        let vote_key = DataKey::HandshakeVoter(meter_id, voter.clone());
-        if env.storage().instance().has(&vote_key) {
-            panic_with_error!(&env, ContractError::HandshakeAlreadyVoted);
-        }
-
-        handshake.votes_for += 1;
-        env.storage()
-            .instance()
-            .set(&DataKey::CommunityHandshake(meter_id), &handshake);
-        env.storage().instance().set(&vote_key, &true);
-
-        env.events().publish(
-            (symbol_short!("HndshkVt"), meter_id),
-            (voter, handshake.votes_for),
-        );
-    }
-
-    /// Release locked funds after the community vote threshold is met.
-    /// The stream must be inactive (fully dripped) and the vote quorum met.
-    /// Only the provider can trigger the actual fund release.
-    pub fn release_locked_funds(env: Env, meter_id: u64) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-
-        if !meter.community_handshake_enabled {
-            panic_with_error!(&env, ContractError::HandshakeNotEnabled);
-        }
-
-        if meter.handshake_released {
-            panic_with_error!(&env, ContractError::HandshakeAlreadyReleased);
-        }
-
-        let mut handshake: CommunityHandshake = env
-            .storage()
-            .instance()
-            .get(&DataKey::CommunityHandshake(meter_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::HandshakeNotEnabled));
-
-        if handshake.is_released {
-            panic_with_error!(&env, ContractError::HandshakeAlreadyReleased);
-        }
-
-        if handshake.votes_for < handshake.votes_required {
-            panic_with_error!(&env, ContractError::HandshakeVoteFailed);
-        }
-
-        // Calculate the locked amount (10% of total deposited)
-        let locked_amount =
-            (meter.total_deposited * HANDSHAKE_LOCK_PERCENT) / 100;
-
-        if locked_amount <= 0 {
-            // Nothing to release
-            meter.handshake_released = true;
-            handshake.is_released = true;
-            env.storage()
-                .instance()
-                .set(&DataKey::Meter(meter_id), &meter);
-            env.storage()
-                .instance()
-                .set(&DataKey::CommunityHandshake(meter_id), &handshake);
-            return;
-        }
-
-        // Transfer locked funds to the provider
-        let release = locked_amount.min(meter.balance.max(0));
-        if release > 0 {
-            let client = token::Client::new(&env, &meter.token);
-            client.transfer(
-                &env.current_contract_address(),
-                &meter.provider,
-                &release,
-            );
-            meter.balance = meter.balance.saturating_sub(release);
-        }
-
-        meter.handshake_released = true;
-        handshake.is_released = true;
-        handshake.locked_amount = locked_amount;
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Meter(meter_id), &meter);
-        env.storage()
-            .instance()
-            .set(&DataKey::CommunityHandshake(meter_id), &handshake);
-
-        env.events().publish(
-            (symbol_short!("HndshkRl"), meter_id),
-            release,
-        );
-    }
-
-    /// Query the current community handshake status for a meter.
-    pub fn get_handshake_status(
-        env: Env,
-        meter_id: u64,
-    ) -> Option<CommunityHandshake> {
-        env.storage()
-            .instance()
-            .get(&DataKey::CommunityHandshake(meter_id))
-    }
-
-    /// Returns the amount currently locked by the handshake (10% of total
-    /// deposited). Returns 0 when the handshake is not enabled or already
-    /// released.
-    pub fn get_locked_amount(env: Env, meter_id: u64) -> i128 {
-        let meter = get_meter_or_panic(&env, meter_id);
-        if !meter.community_handshake_enabled || meter.handshake_released {
-            return 0;
-        }
-        (meter.total_deposited * HANDSHAKE_LOCK_PERCENT) / 100
     }
 }
 
