@@ -1,4 +1,9 @@
-use soroban_sdk::{contracttype, Env};
+use soroban_sdk::num::int_to_string;
+use soroban_sdk::ToString;
+use alloc::string::ToString;
+use soroban_sdk::contracttype;
+use soroban_sdk::String;
+use soroban_sdk::{Address, Env};
 
 pub struct GasCostEstimator;
 
@@ -39,10 +44,10 @@ impl GasCostEstimator {
     pub fn estimate_provider_monthly_cost(
         _env: &Env,
         number_of_meters: u32,
-        percentage_group_meters_x100: u32,
+        percentage_group_meters: i32, // Represent as integer percent (e.g., 80 for 80%)
     ) -> i128 {
-        let group_meters = (number_of_meters * percentage_group_meters_x100) / 100;
-        let individual_meters = number_of_meters.saturating_sub(group_meters);
+        let group_meters = (number_of_meters as i32 * percentage_group_meters / 100) as u32;
+        let individual_meters = number_of_meters - group_meters;
 
         let group_cost = if group_meters > 0 {
             let groups = group_meters / 5;
@@ -67,7 +72,7 @@ impl GasCostEstimator {
         number_of_meters: u32,
         group_billing_enabled: bool,
     ) -> LargeScaleCostEstimate {
-        let percentage_group_x100: u32 = if group_billing_enabled { 80 } else { 0 };
+        let percentage_group = if group_billing_enabled { 80 } else { 0 }; // 80% in groups if enabled
         let monthly_cost =
             Self::estimate_provider_monthly_cost(env, number_of_meters, percentage_group_x100);
 
@@ -78,10 +83,10 @@ impl GasCostEstimator {
             0
         };
 
+        // Convert to XLM (1 XLM = 10,000,000 stroops)
         let monthly_cost_xlm = monthly_cost / 10_000_000;
         let annual_cost_xlm = annual_cost / 10_000_000;
         let cost_per_meter_xlm = cost_per_meter / 10_000_000;
-
         LargeScaleCostEstimate {
             number_of_meters,
             monthly_cost_stroops: monthly_cost,
@@ -129,4 +134,7 @@ pub struct LargeScaleCostEstimate {
     pub annual_cost_xlm: i128,
     pub cost_per_meter_xlm: i128,
     pub group_billing_enabled: bool,
+}
+
+impl LargeScaleCostEstimate {
 }
