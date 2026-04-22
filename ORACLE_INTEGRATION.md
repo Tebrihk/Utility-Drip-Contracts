@@ -31,11 +31,18 @@ The solution consists of two main components:
 - **Provider Withdrawals**: Allows providers to withdraw earnings in XLM
 - **Conversion Events**: Emits events for transparency
 - **Backward Compatibility**: Works with existing custom tokens
+- **Emergency Trust Mode**: Enables manual recovery when oracle heartbeat is stale for 72 hours
+- **Unanimous Governance Guard**: Emergency actions require 100% approval from all active members
 
 #### New Functions:
 - `top_up()` - Enhanced to handle XLM→USD conversion
 - `withdraw_earnings()` - New function for USD→XLM conversion
 - `get_current_rate()` - Get current exchange rate
+- `is_trust_mode()` - Returns true when oracle heartbeat is stale for more than 72 hours
+- `propose_emergency_flow_rate()` - Create emergency proposal to set manual flow rate
+- `propose_emergency_pause()` - Create emergency proposal to pause a meter cycle
+- `approve_emergency_action()` - Approve an emergency proposal (one vote per member)
+- `execute_emergency_action()` - Execute only after unanimous member approval
 
 ## Usage Flow
 
@@ -76,6 +83,48 @@ New error types added:
 2. **Staleness Checks**: Rejects old price data
 3. **Access Control**: Admin controls updater role
 4. **Event Logging**: All conversions emit events for transparency
+5. **Trust Mode Gate**: Emergency manual controls are blocked while oracle heartbeat is healthy
+6. **Strict Unanimity**: Every registered active member must approve emergency actions
+7. **Duplicate Vote Prevention**: A member can approve a proposal only once
+
+## Trust Mode and Manual Fallback
+
+### Activation Rule
+
+Trust Mode is derived from on-chain oracle heartbeat state:
+
+- Utility contract fetches oracle `PriceData.last_updated`
+- If `now - last_updated > 72 hours`, Trust Mode is active
+- If no oracle address is configured, Trust Mode is treated as active for recovery operations
+
+Boundary behavior is strict:
+
+- exactly 72 hours stale: not yet in Trust Mode
+- greater than 72 hours stale: Trust Mode active
+
+### Allowed Actions in Trust Mode
+
+Only in Trust Mode, active members can unanimously approve:
+
+1. manual `max_flow_rate_per_hour` update for a meter
+2. manual cycle pause (`is_paused = true`) for a meter
+
+Outside Trust Mode these manual emergency actions revert.
+
+### Member Eligibility and Unanimity
+
+- Members are addresses registered through `register_active_user()`
+- Membership is tracked uniquely per address
+- Proposal creator auto-approves their proposal
+- Additional approvals are counted once per member
+- Execution requires `approval_count == active_member_count`
+
+### Oracle Recovery Assumption
+
+- When oracle heartbeat becomes healthy again, new emergency proposals and approvals are blocked
+- Already executed emergency actions remain in state (no automatic rollback)
+
+This keeps fallback narrowly scoped to catastrophic oracle inactivity without weakening normal oracle-driven behavior.
 
 ## Testing
 

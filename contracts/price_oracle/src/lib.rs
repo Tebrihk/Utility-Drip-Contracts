@@ -5,9 +5,9 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
-    pub price: i128,        // Price in smallest units (e.g., cents for USD)
-    pub decimals: u32,      // Number of decimal places
-    pub last_updated: u64,  // Timestamp of last update
+    pub price: i128,       // Price in smallest units (e.g., cents for USD)
+    pub decimals: u32,     // Number of decimal places
+    pub last_updated: u64, // Timestamp of last update
 }
 
 #[contracttype]
@@ -35,8 +35,19 @@ pub struct PriceOracle;
 #[contractimpl]
 impl PriceOracle {
     /// Initialize the oracle with admin and updater addresses
-    pub fn initialize(env: Env, admin: Address, updater: Address, initial_price: i128, decimals: u32) {
-        if env.storage().instance().get::<DataKey, Address>(&DataKey::Admin).is_some() {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        updater: Address,
+        initial_price: i128,
+        decimals: u32,
+    ) {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .is_some()
+        {
             panic!("already initialized");
         }
 
@@ -46,7 +57,7 @@ impl PriceOracle {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Updater, &updater);
-        
+
         let price_data = PriceData {
             price: initial_price,
             decimals,
@@ -57,10 +68,12 @@ impl PriceOracle {
 
     /// Update the price (only callable by updater)
     pub fn update_price(env: Env, new_price: i128) {
-        let updater = env.storage().instance()
+        let updater = env
+            .storage()
+            .instance()
             .get::<DataKey, Address>(&DataKey::Updater)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-        
+
         updater.require_auth();
 
         if new_price <= 0 {
@@ -77,7 +90,8 @@ impl PriceOracle {
 
     /// Get current price data
     pub fn get_price(env: Env) -> PriceData {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get::<DataKey, PriceData>(&DataKey::Price)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
     }
@@ -86,11 +100,11 @@ impl PriceOracle {
     pub fn get_fresh_price(env: Env) -> PriceData {
         let price_data = Self::get_price(env.clone());
         let now = env.ledger().timestamp();
-        
+
         if now.saturating_sub(price_data.last_updated) > MAX_PRICE_AGE_SECONDS {
             panic_with_error!(env, ContractError::StalePrice);
         }
-        
+
         price_data
     }
 
@@ -107,7 +121,7 @@ impl PriceOracle {
     /// Convert XLM amount to USD cents
     pub fn xlm_to_usd_cents(env: Env, xlm_amount: i128) -> i128 {
         let price_data = Self::get_fresh_price(env);
-        
+
         // price is in cents per XLM, so multiply
         xlm_amount.saturating_mul(price_data.price) / (10_i128.pow(price_data.decimals))
     }
@@ -115,7 +129,7 @@ impl PriceOracle {
     /// Convert USD cents to XLM amount
     pub fn usd_cents_to_xlm(env: Env, usd_cents: i128) -> i128 {
         let price_data = Self::get_fresh_price(env);
-        
+
         // price is in cents per XLM, so divide
         usd_cents.saturating_mul(10_i128.pow(price_data.decimals)) / price_data.price
     }
@@ -129,33 +143,41 @@ impl PriceOracle {
 
     /// Admin functions
     pub fn set_admin(env: Env, new_admin: Address) {
-        let admin = env.storage().instance()
+        let admin = env
+            .storage()
+            .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-        
+
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
     }
 
     pub fn set_updater(env: Env, new_updater: Address) {
-        let admin = env.storage().instance()
+        let admin = env
+            .storage()
+            .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized));
-        
+
         admin.require_auth();
-        env.storage().instance().set(&DataKey::Updater, &new_updater);
+        env.storage()
+            .instance()
+            .set(&DataKey::Updater, &new_updater);
     }
 
     /// Get admin address
     pub fn get_admin(env: Env) -> Address {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
     }
 
     /// Get updater address  
     pub fn get_updater(env: Env) -> Address {
-        env.storage().instance()
+        env.storage()
+            .instance()
             .get::<DataKey, Address>(&DataKey::Updater)
             .unwrap_or_else(|| panic_with_error!(env, ContractError::NotInitialized))
     }

@@ -1,6 +1,11 @@
+.idea/
 # Rust's output directory
 target
 
 # Local settings
 .soroban
 .stellar
+
+.agent/
+agents/
+issue.md

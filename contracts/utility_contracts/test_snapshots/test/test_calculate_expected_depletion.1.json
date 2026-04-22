@@ -310,6 +310,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "is_paired"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "last_claim_time"
                             },
                             "val": {
@@ -358,7 +366,7 @@
                           },
                           {
                             "key": {
-                              "symbol": "rate_per_second"
+                              "symbol": "rate_per_unit"
                             },
                             "val": {
                               "i128": "10"

@@ -263,6 +263,14 @@
                               "symbol": "is_active"
                             },
                             "val": {
+                              "bool": true
+                            }
+                          },
+                          {
+                            "key": {
+                              "symbol": "is_paired"
+                            },
+                            "val": {
                               "bool": false
                             }
                           },

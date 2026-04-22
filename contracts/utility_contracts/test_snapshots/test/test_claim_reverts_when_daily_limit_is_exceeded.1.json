@@ -310,6 +310,14 @@
                           },
                           {
                             "key": {
+                              "symbol": "is_paired"
+                            },
+                            "val": {
+                              "bool": false
+                            }
+                          },
+                          {
+                            "key": {
                               "symbol": "last_claim_time"
                             },
                             "val": {

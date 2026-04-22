@@ -1,0 +1,22 @@
+# Tarpaulin configuration for test coverage
+[config]
+# Fail if coverage is below 85%
+fail-under = 85.0
+
+# Output formats
+output-types = ["Html", "Xml", "Json"]
+
+# Include test files in coverage
+include-tests = true
+
+# Run tests with debug info
+debug = true
+
+# Exclude specific files or patterns if needed
+# exclude = ["path/to/exclude"]
+
+# Target directory
+target-dir = "target"
+
+# Workspace coverage
+workspace = true

@@ -10,6 +10,7 @@ This implementation adds support for the native Stellar asset (XLM) alongside st
 - `transfer_tokens()`: Handles transfers for both native XLM and SAC tokens
 - `get_token_balance()`: Gets balances for both token types
 - `get_native_token_address()`: Test helper for creating native token addresses
+ - `enforce_xlm_gas_reserve()`: Prevents draining the last 5 XLM needed for future transactions
 
 ### 2. Updated Functions
 - `apply_provider_claim()`: Now uses the new transfer_tokens helper
@@ -22,13 +23,19 @@ This implementation adds support for the native Stellar asset (XLM) alongside st
 ## How It Works
 
 ### Native Token Detection
-The `is_native_token()` function checks if a token address matches known patterns for native XLM:
+The `is_native_token()` function treats the contract address as native for internal flows and
+checks token metadata for `symbol == "XLM"` or `"NATIVE"`:
 ```rust
-fn is_native_token(token_address: &Address) -> bool {
-    let addr_str = token_address.to_string();
-    addr_str.starts_with("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABG5ydGg") ||
-    addr_str.starts_with("CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2Y2W3U2XPIVVU4XZQ4") ||
-    addr_str.contains("NATIVE")
+fn is_native_token(env: &Env, token_address: &Address) -> bool {
+    if token_address == &env.current_contract_address() {
+        return true;
+    }
+
+    let client = token::Client::new(env, token_address);
+    let symbol = client.symbol();
+
+    symbol == soroban_sdk::String::from_str(env, "XLM")
+        || symbol == soroban_sdk::String::from_str(env, "NATIVE")
 }
 ```
 
@@ -46,6 +53,11 @@ fn transfer_tokens(env: &Env, token_address: &Address, from: &Address, to: &Addr
     }
 }
 ```
+
+### Gas Reserve Requirement
+When funding streams with native XLM, the contract enforces a 5 XLM minimum
+reserve in the payer's wallet to ensure they can always submit stop/update
+transactions.
 
 ## Testing
 
