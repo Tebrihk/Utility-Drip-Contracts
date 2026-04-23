@@ -55,6 +55,8 @@ mod gas_estimator;
 use gas_estimator::GasCostEstimator;
 
 pub mod grant_stream_listener;
+pub mod velocity_limit;
+use velocity_limit::{check_velocity_limits, apply_override, revoke_override, get_velocity_config, set_velocity_config, VelocityDataKey};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SavingGoal {
@@ -315,6 +317,9 @@ pub enum DataKey {
     WithdrawalRequest(Address, u64),   // Provider address, request ID -> WithdrawalRequest
     WithdrawalRequestCount(Address),   // Provider address -> request counter
     WithdrawalApproval(Address, u64, Address), // Provider, request ID, signer -> bool
+    // Streaming-Limit Circuit Breaker
+    VelocityLimitConfig,               // Global velocity configuration
+    VelocityOverride(u64),             // meter_id (0 for global) -> VelocityOverride
 }
 
 #[contracterror]
@@ -408,6 +413,10 @@ pub enum ContractError {
     InvalidGrantAmount = 73,
     GrantStreamNotConfigured = 74,
     InsufficientWaterSavings = 75,
+    // Streaming-Limit Circuit Breaker Errors
+    PerStreamVelocityLimitExceeded = 76,
+    GlobalVelocityLimitExceeded = 77,
+    VelocityLimitBreach = 78,
 }
 
 #[contracttype]
@@ -448,6 +457,23 @@ fn get_effective_rate(env: &Env, meter: &Meter, timestamp: u64) -> i128 {
         let mut window = get_provider_window_or_default(&env, &meter.provider, now);
         
         let settlement = settle_claim_for_meter(&env, meter_id, &mut meter, now, &mut window);
+        
+        // === STREAMING-LIMIT CIRCUIT BREAKER ===
+        // Check velocity limits BEFORE processing the claim
+        // This prevents smart contract bugs from draining streams too quickly
+        if settlement.gross_claimed > 0 {
+            // Check per-stream velocity limit
+            if let Err(error) = check_velocity_limits(&env, meter_id, &meter.provider, settlement.gross_claimed) {
+                if error == symbol_short!("vlimit") {
+                    panic_with_error!(&env, ContractError::PerStreamVelocityLimitExceeded);
+                } else if error == symbol_short!("gvlimit") {
+                    panic_with_error!(&env, ContractError::GlobalVelocityLimitExceeded);
+                } else {
+                    panic_with_error!(&env, ContractError::VelocityLimitBreach);
+                }
+            }
+        }
+        
         let client = token::Client::new(&env, &meter.token);
 
         // 1. Pay Government Tax
@@ -1045,6 +1071,77 @@ impl UtilityContract {
 
         meter.green_energy_discount_bps = discount_bps;
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
+    }
+
+    // ============================================================================
+    // Streaming-Limit Circuit Breaker Admin Functions
+    // ============================================================================
+
+    /// Configure velocity limit parameters (admin only)
+    /// 
+    /// Parameters:
+    /// - `admin`: Admin address that must authorize this change
+    /// - `global_limit`: Maximum system-wide outflow per 24 hours
+    /// - `per_stream_limit`: Maximum per-meter outflow per 24 hours
+    /// - `is_enabled`: Whether velocity limiting is active
+    pub fn set_velocity_limit_config(
+        env: Env,
+        admin: Address,
+        global_limit: i128,
+        per_stream_limit: i128,
+        is_enabled: bool,
+    ) {
+        admin.require_auth();
+        
+        // Validate limits
+        if global_limit <= 0 || per_stream_limit <= 0 {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+        
+        if per_stream_limit > global_limit {
+            panic_with_error!(&env, ContractError::VelocityLimitBreach);
+        }
+        
+        let config = velocity_limit::VelocityConfig {
+            global_limit,
+            per_stream_limit,
+            is_enabled,
+            admin_multisig: admin.clone(),
+        };
+        
+        set_velocity_config(&env, admin, config);
+    }
+
+    /// Apply override to suspend velocity limits (admin multi-sig only)
+    /// 
+    /// Parameters:
+    /// - `admin`: Admin multi-sig address
+    /// - `meter_id`: Meter to override (0 for global override)
+    /// - `expires_at`: When override expires (0 = never expires)
+    /// - `reason`: Reason code for audit trail (e.g., "false_positive", "maintenance")
+    pub fn apply_velocity_override(
+        env: Env,
+        admin: Address,
+        meter_id: u64,
+        expires_at: u64,
+        reason: Symbol,
+    ) {
+        apply_override(&env, admin, meter_id, expires_at, reason);
+    }
+
+    /// Revoke an active velocity override (admin only)
+    /// 
+    /// Parameters:
+    /// - `admin`: Admin address
+    /// - `meter_id`: Meter override to revoke (0 for global override)
+    pub fn revoke_velocity_override(env: Env, admin: Address, meter_id: u64) {
+        admin.require_auth();
+        revoke_override(&env, meter_id);
+    }
+
+    /// Get current velocity limit configuration
+    pub fn get_velocity_limits(env: Env) -> Option<velocity_limit::VelocityConfig> {
+        get_velocity_config(&env)
     }
 
     pub fn register_meter(
