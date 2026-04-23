@@ -34,6 +34,8 @@ mod dust_sweeper_tests;
 mod pause_resume_tests;
 #[cfg(test)]
 mod pause_resume_fuzz_tests;
+#[cfg(test)]
+mod buffer_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -62,9 +64,16 @@ pub struct ContinuousFlow {
     pub status: StreamStatus,       // 1 byte (enum)
     pub paused_at: u64,           // 8 bytes - timestamp when stream was paused (0 if active)
     pub provider: Address,         // 32 bytes - provider address for access control
+    pub buffer_balance: i128,     // 16 bytes - pre-paid buffer balance (24 hours of flow)
+    pub buffer_warning_sent: bool, // 1 byte - whether buffer warning has been sent
+    pub payer: Address,           // 32 bytes - payer address for buffer refunds
 }
 // Minimum balance required to keep the IoT relay open (500 tokens for testing)
 const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
+
+// Buffer requirements - 24 hours of flow rate
+const BUFFER_DURATION_SECONDS: u64 = 24 * HOUR_IN_SECONDS; // 24 hours
+const BUFFER_WARNING_THRESHOLD: i128 = 3600; // Warning when 1 hour of buffer left
 
 #[contracttype]
 #[derive(Clone)]
@@ -180,6 +189,24 @@ pub struct StreamResumedEvent {
 
 #[contracttype]
 #[derive(Clone)]
+pub struct BufferWarningEvent {
+    pub stream_id: u64,
+    pub warning_timestamp: u64,
+    pub buffer_remaining: i128,
+    pub provider: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct BufferDepletedEvent {
+    pub stream_id: u64,
+    pub depleted_timestamp: u64,
+    pub buffer_consumed: i128,
+    pub provider: Address,
+}
+
+#[contracttype]
+#[derive(Clone)]
 pub struct DustCollectedEvent {
     pub token_address: Address,
     pub total_dust_swept: i128,
@@ -211,6 +238,7 @@ pub enum DataKey {
     DustAggregation(Address),
     AdminAddress,
     GasBountyPool,
+    BufferVault(u64), // Per-stream buffer vault tracking
 }
 
 #[contracterror]
@@ -235,6 +263,9 @@ pub enum ContractError {
     UnauthorizedAdmin = 16,
     InsufficientGasBounty = 17,
     NoDustToSweep = 18,
+    InsufficientBuffer = 19,
+    BufferAlreadyDepleted = 20,
+    UnauthorizedBufferAccess = 21,
 }
 
 #[contracttype]
@@ -616,13 +647,15 @@ fn publish_inactive_event(env: &Env, meter_id: u64, now: u64) {
 
 // Continuous Flow Math Engine Functions
 
-/// Create a new continuous flow stream with timestamp-based tracking
+/// Create a new continuous flow stream with timestamp-based tracking and buffer vault
 fn create_continuous_flow(
     stream_id: u64,
     flow_rate_per_second: i128,
     initial_balance: i128,
+    buffer_amount: i128,
     current_timestamp: u64,
     provider: Address,
+    payer: Address,
 ) -> ContinuousFlow {
     ContinuousFlow {
         stream_id,
@@ -633,10 +666,19 @@ fn create_continuous_flow(
         status: if initial_balance > 0 { StreamStatus::Active } else { StreamStatus::Paused },
         paused_at: 0, // Not paused initially
         provider,
+        buffer_balance: buffer_amount,
+        buffer_warning_sent: false,
+        payer,
     }
 }
 
-/// Calculate flow accumulation since last update with precise timestamp math
+/// Calculate required buffer amount (24 hours of flow rate)
+fn calculate_required_buffer(flow_rate_per_second: i128) -> i128 {
+    let buffer_duration_i128 = BUFFER_DURATION_SECONDS as i128;
+    flow_rate_per_second.saturating_mul(buffer_duration_i128)
+}
+
+/// Calculate flow accumulation since last update with precise timestamp math and buffer logic
 fn calculate_flow_accumulation(
     flow: &ContinuousFlow,
     current_timestamp: u64,
@@ -661,35 +703,73 @@ fn calculate_flow_accumulation(
     accumulated
 }
 
-/// Update flow with new timestamp and handle underflow risks
+/// Update flow with new timestamp and handle underflow risks with buffer depletion logic
 fn update_continuous_flow(
+    env: &Env,
     flow: &mut ContinuousFlow,
     current_timestamp: u64,
 ) -> Result<i128, ContractError> {
     let accumulation = calculate_flow_accumulation(flow, current_timestamp);
     
-    // Handle underflow: ensure we don't go below zero balance
-    if flow.accumulated_balance < accumulation {
-        // Deplete the balance and set status to Depleted
-        let actual_deduction = flow.accumulated_balance;
+    let mut total_deduction = accumulation;
+    let mut buffer_used = 0i128;
+    
+    // First, try to deduct from main balance
+    if flow.accumulated_balance >= accumulation {
+        // Normal case: deduct from main balance only
+        flow.accumulated_balance = flow.accumulated_balance.saturating_sub(accumulation);
+    } else {
+        // Main balance insufficient, use buffer
+        let remaining_deduction = accumulation.saturating_sub(flow.accumulated_balance);
+        buffer_used = remaining_deduction;
+        
+        // Check if buffer has sufficient funds
+        if flow.buffer_balance < remaining_deduction {
+            // Buffer insufficient, terminate stream
+            let actual_buffer_deduction = flow.buffer_balance;
+            total_deduction = flow.accumulated_balance.saturating_add(actual_buffer_deduction);
+            
+            flow.accumulated_balance = 0;
+            flow.buffer_balance = 0;
+            flow.status = StreamStatus::Depleted;
+            flow.last_flow_timestamp = current_timestamp;
+            
+            // Emit BufferDepleted event
+            env.events().publish(
+                symbol_short!("BufferDepleted"),
+                (flow.stream_id, current_timestamp, actual_buffer_deduction, flow.provider.clone())
+            );
+            
+            return Ok(total_deduction);
+        }
+        
+        // Deduct from main balance (to zero) and then from buffer
+        total_deduction = flow.accumulated_balance.saturating_add(remaining_deduction);
         flow.accumulated_balance = 0;
-        flow.status = StreamStatus::Depleted;
-        flow.last_flow_timestamp = current_timestamp;
-        return Ok(actual_deduction);
+        flow.buffer_balance = flow.buffer_balance.saturating_sub(remaining_deduction);
+        
+        // Check if buffer warning should be sent
+        if !flow.buffer_warning_sent && flow.buffer_balance <= BUFFER_WARNING_THRESHOLD {
+            flow.buffer_warning_sent = true;
+            
+            // Emit BufferWarning event
+            env.events().publish(
+                symbol_short!("BufferWarning"),
+                (flow.stream_id, current_timestamp, flow.buffer_balance, flow.provider.clone())
+            );
+        }
     }
     
-    // Normal case: deduct accumulation from balance
-    flow.accumulated_balance = flow.accumulated_balance.saturating_sub(accumulation);
     flow.last_flow_timestamp = current_timestamp;
     
-    // Update status based on remaining balance
-    if flow.accumulated_balance == 0 {
+    // Update status based on remaining balances
+    if flow.accumulated_balance == 0 && flow.buffer_balance == 0 {
         flow.status = StreamStatus::Depleted;
-    } else if flow.status == StreamStatus::Paused && flow.accumulated_balance > 0 {
+    } else if flow.status == StreamStatus::Paused && (flow.accumulated_balance > 0 || flow.buffer_balance > 0) {
         flow.status = StreamStatus::Active;
     }
     
-    Ok(accumulation)
+    Ok(total_deduction)
 }
 
 /// Pause a continuous flow stream (provider only)
@@ -710,7 +790,7 @@ fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), Con
     let current_timestamp = env.ledger().timestamp();
     
     // Update flow calculation up to pause moment
-    update_continuous_flow(&mut flow, current_timestamp)?;
+    update_continuous_flow(env, &mut flow, current_timestamp)?;
     
     // Set paused status and record timestamp
     flow.status = StreamStatus::Paused;
@@ -756,7 +836,7 @@ fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Addr
     let pause_duration = current_timestamp.saturating_sub(flow.paused_at);
     
     // Handle edge case: stream depleted exactly when paused
-    if flow.accumulated_balance == 0 {
+    if flow.accumulated_balance == 0 && flow.buffer_balance == 0 {
         flow.status = StreamStatus::Depleted;
         env.storage()
             .instance()
@@ -803,7 +883,7 @@ fn update_flow_rate(
     // Update status based on new flow rate and balance
     if new_flow_rate == 0 {
         flow.status = StreamStatus::Paused;
-    } else if flow.accumulated_balance > 0 && flow.status == StreamStatus::Paused {
+    } else if (flow.accumulated_balance > 0 || flow.buffer_balance > 0) && flow.status == StreamStatus::Paused {
         flow.status = StreamStatus::Active;
     }
     
@@ -845,6 +925,89 @@ fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
     }
 }
 
+/// Refund buffer to payer on amicable stream closure
+fn refund_buffer(env: &Env, stream_id: u64) -> Result<i128, ContractError> {
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Only refund if stream is not depleted (amicable closure)
+    if flow.status == StreamStatus::Depleted {
+        return Err(ContractError::BufferAlreadyDepleted);
+    }
+    
+    let buffer_amount = flow.buffer_balance;
+    
+    if buffer_amount <= 0 {
+        return Err(ContractError::InsufficientBuffer);
+    }
+    
+    // Clear buffer balance
+    flow.buffer_balance = 0;
+    flow.status = StreamStatus::Depleted;
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    // Transfer buffer back to payer
+    transfer_tokens(
+        env,
+        &env.current_contract_address(), // Assuming native token for simplicity
+        &env.current_contract_address(),
+        &flow.payer,
+        &buffer_amount,
+    );
+    
+    // Emit refund event
+    env.events().publish(
+        symbol_short!("BufferRefunded"),
+        (stream_id, buffer_amount, flow.payer.clone())
+    );
+    
+    Ok(buffer_amount)
+}
+
+/// Add additional buffer to existing stream
+fn add_buffer_to_stream(
+    env: &Env,
+    stream_id: u64,
+    additional_buffer: i128,
+) -> Result<(), ContractError> {
+    if additional_buffer <= 0 {
+        return Err(ContractError::InvalidTokenAmount);
+    }
+    
+    let mut flow = get_continuous_flow_or_panic(env, stream_id);
+    
+    // Verify payer authorization
+    flow.payer.require_auth();
+    
+    // Update flow calculation first
+    let current_timestamp = env.ledger().timestamp();
+    update_continuous_flow(env, &mut flow, current_timestamp)?;
+    
+    // Add buffer with overflow protection
+    flow.buffer_balance = flow.buffer_balance.saturating_add(additional_buffer);
+    
+    // Reset warning flag if buffer was significantly increased
+    if additional_buffer >= BUFFER_WARNING_THRESHOLD {
+        flow.buffer_warning_sent = false;
+    }
+    
+    // Store updated flow
+    env.storage()
+        .instance()
+        .set(&DataKey::ContinuousFlow(stream_id), &flow);
+    
+    // Emit buffer added event
+    env.events().publish(
+        symbol_short!("BufferAdded"),
+        (stream_id, additional_buffer)
+    );
+    
+    Ok(())
+}
+
 /// Add balance to continuous flow with underflow protection
 fn add_balance_to_flow(
     env: &Env,
@@ -859,13 +1022,13 @@ fn add_balance_to_flow(
     
     // Update flow calculation first
     let current_timestamp = env.ledger().timestamp();
-    update_continuous_flow(&mut flow, current_timestamp)?;
+    update_continuous_flow(env, &mut flow, current_timestamp)?;
     
     // Add new balance with overflow protection
     flow.accumulated_balance = flow.accumulated_balance.saturating_add(additional_balance);
     
     // Update status if needed
-    if flow.accumulated_balance > 0 && flow.flow_rate_per_second > 0 {
+    if (flow.accumulated_balance > 0 || flow.buffer_balance > 0) && flow.flow_rate_per_second > 0 {
         flow.status = StreamStatus::Active;
     }
     
@@ -891,18 +1054,18 @@ fn withdraw_from_flow(
     
     // Update flow calculation first
     let current_timestamp = env.ledger().timestamp();
-    update_continuous_flow(&mut flow, current_timestamp)?;
+    update_continuous_flow(env, &mut flow, current_timestamp)?;
     
-    // Check if sufficient balance available
+    // Check if sufficient balance available (main balance only, buffer is protected)
     if flow.accumulated_balance < withdrawal_amount {
         return Err(ContractError::InvalidTokenAmount);
     }
     
-    // Perform withdrawal
+    // Perform withdrawal from main balance only
     flow.accumulated_balance = flow.accumulated_balance.saturating_sub(withdrawal_amount);
     
     // Update status if depleted
-    if flow.accumulated_balance == 0 {
+    if flow.accumulated_balance == 0 && flow.buffer_balance == 0 {
         flow.status = StreamStatus::Depleted;
     }
     
@@ -1750,22 +1913,45 @@ impl UtilityContract {
 
     // Continuous Flow Engine Public Interface
 
-    /// Create a new continuous flow stream
+    /// Create a new continuous flow stream with mandatory buffer deposit
+    /// Buffer must equal at least 24 hours of the negotiated flow rate
     pub fn create_continuous_stream(
         env: Env,
         stream_id: u64,
         flow_rate_per_second: i128,
         initial_balance: i128,
         provider: Address,
+        payer: Address,
     ) {
         provider.require_auth(); // Provider must authorize stream creation
+        payer.require_auth(); // Payer must authorize buffer deposit
         
         if flow_rate_per_second < 0 || initial_balance < 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         
+        // Calculate required buffer (24 hours of flow rate)
+        let required_buffer = calculate_required_buffer(flow_rate_per_second);
+        
+        // Transfer buffer from payer to contract
+        transfer_tokens(
+            &env,
+            &env.current_contract_address(), // Assuming native token
+            &payer,
+            &env.current_contract_address(),
+            &required_buffer,
+        );
+        
         let current_timestamp = env.ledger().timestamp();
-        let flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp, provider.clone());
+        let flow = create_continuous_flow(
+            stream_id, 
+            flow_rate_per_second, 
+            initial_balance, 
+            required_buffer,
+            current_timestamp, 
+            provider.clone(),
+            payer.clone()
+        );
         
         env.storage()
             .instance()
@@ -1773,7 +1959,7 @@ impl UtilityContract {
         
         env.events().publish(
             symbol_short!("StreamCreated"),
-            (stream_id, flow_rate_per_second, initial_balance, current_timestamp, provider)
+            (stream_id, flow_rate_per_second, initial_balance, required_buffer, current_timestamp, provider, payer)
         );
     }
 
@@ -1796,6 +1982,31 @@ impl UtilityContract {
         );
     }
 
+    /// Add additional buffer to an existing stream
+    pub fn add_continuous_buffer(env: Env, stream_id: u64, additional_buffer: i128) {
+        add_buffer_to_stream(&env, stream_id, additional_buffer).unwrap();
+    }
+
+    /// Close stream amicably and refund buffer to payer
+    pub fn close_stream_amicably(env: Env, stream_id: u64) -> i128 {
+        let provider = env.invoker(); // Use invoker as provider
+        let mut flow = get_continuous_flow_or_panic(&env, stream_id);
+        
+        // Verify provider authorization
+        if flow.provider != provider {
+            panic_with_error!(&env, ContractError::UnauthorizedAdmin);
+        }
+        
+        // Update flow calculation first
+        let current_timestamp = env.ledger().timestamp();
+        update_continuous_flow(&env, &mut flow, current_timestamp).unwrap();
+        
+        // Refund buffer
+        let refunded_amount = refund_buffer(&env, stream_id).unwrap();
+        
+        refunded_amount
+    }
+
     /// Withdraw from a continuous flow stream
     pub fn withdraw_continuous(env: Env, stream_id: u64, withdrawal_amount: i128) -> i128 {
         let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
@@ -1815,9 +2026,29 @@ impl UtilityContract {
             .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
     }
 
+    /// Get the required buffer amount for a given flow rate
+    pub fn get_required_buffer(env: Env, flow_rate_per_second: i128) -> i128 {
+        calculate_required_buffer(flow_rate_per_second)
+    }
+
+    /// Get current buffer balance for a stream
+    pub fn get_buffer_balance(env: Env, stream_id: u64) -> Option<i128> {
+        if let Some(flow) = env.storage()
+            .instance()
+            .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
+        {
+            let current_timestamp = env.ledger().timestamp();
+            let mut flow_copy = flow.clone();
+            update_continuous_flow(&env, &mut flow_copy, current_timestamp).unwrap();
+            Some(flow_copy.buffer_balance)
+        } else {
+            None
+        }
+    }
+
     /// Calculate expected depletion time for a continuous flow stream
     pub fn calculate_continuous_depletion(env: Env, stream_id: u64) -> Option<u64> {
-        if let Some(flow) = env.storage()
+        if let Some(mut flow) = env.storage()
             .instance()
             .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
         {
@@ -1827,13 +2058,14 @@ impl UtilityContract {
             
             let current_timestamp = env.ledger().timestamp();
             let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
-            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            let remaining_main_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            let total_remaining = remaining_main_balance.saturating_add(flow.buffer_balance);
             
-            if remaining_balance <= 0 {
+            if total_remaining <= 0 {
                 return Some(current_timestamp);
             }
             
-            let seconds_until_depletion = remaining_balance / flow.flow_rate_per_second;
+            let seconds_until_depletion = total_remaining / flow.flow_rate_per_second;
             Some(current_timestamp + seconds_until_depletion as u64)
         } else {
             None
@@ -1862,9 +2094,9 @@ impl UtilityContract {
         {
             let current_timestamp = env.ledger().timestamp();
             let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
-            let remaining_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            let remaining_main_balance = flow.accumulated_balance.saturating_sub(accumulation);
             
-            Some(remaining_balance)
+            Some(remaining_main_balance)
         } else {
             None
         }
@@ -1992,16 +2224,16 @@ impl UtilityContract {
 
     /// Check if a specific stream has dust balance
     pub fn has_dust(env: Env, stream_id: u64) -> bool {
-        if let Some(flow) = env.storage()
+        if let Some(mut flow) = env.storage()
             .instance()
             .get::<DataKey, ContinuousFlow>(&DataKey::ContinuousFlow(stream_id))
         {
             let current_timestamp = env.ledger().timestamp();
             let accumulation = calculate_flow_accumulation(&flow, current_timestamp);
-            let current_balance = flow.accumulated_balance.saturating_sub(accumulation);
+            let current_main_balance = flow.accumulated_balance.saturating_sub(accumulation);
             
             (flow.status == StreamStatus::Depleted || flow.status == StreamStatus::Paused) 
-                && is_dust_amount(current_balance)
+                && is_dust_amount(current_main_balance)
         } else {
             false
         }
