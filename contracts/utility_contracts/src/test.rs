@@ -457,3 +457,203 @@ fn test_postpaid_top_up_settles_debt_and_resets_when_reactivated() {
     assert_eq!(token.balance(&provider), 110);
     assert_eq!(token.balance(&contract_id), 190);
 }
+
+#[test]
+fn test_gas_buffer_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    // Mint tokens for provider to initialize gas buffer
+    token_admin_client.mint(&provider, &1000);
+
+    // Initialize gas buffer with minimum amount
+    client.initialize_gas_buffer(&provider, &token_address, &100);
+    
+    let gas_buffer = client.get_gas_buffer(&provider).unwrap();
+    assert_eq!(gas_buffer.balance, 100);
+    assert_eq!(gas_buffer.provider, provider);
+    assert_eq!(gas_buffer.token, token_address);
+    assert_eq!(token.balance(&contract_id), 100);
+    assert_eq!(token.balance(&provider), 900);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_gas_buffer_initialization_with_insufficient_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+
+    // Try to initialize with amount below minimum
+    client.initialize_gas_buffer(&provider, &token_address, &50);
+}
+
+#[test]
+fn test_gas_buffer_top_up() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&provider, &1000);
+
+    // Initialize gas buffer
+    client.initialize_gas_buffer(&provider, &token_address, &100);
+    
+    // Top up gas buffer
+    client.top_up_gas_buffer(&provider, &token_address, &200);
+    
+    let gas_buffer = client.get_gas_buffer(&provider).unwrap();
+    assert_eq!(gas_buffer.balance, 300);
+    assert_eq!(token.balance(&contract_id), 300);
+    assert_eq!(token.balance(&provider), 700);
+}
+
+#[test]
+fn test_gas_buffer_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&provider, &1000);
+
+    // Initialize gas buffer
+    client.initialize_gas_buffer(&provider, &token_address, &500);
+    
+    // Withdraw from gas buffer
+    client.withdraw_from_gas_buffer(&provider, &token_address, &200);
+    
+    let gas_buffer = client.get_gas_buffer(&provider).unwrap();
+    assert_eq!(gas_buffer.balance, 300);
+    assert_eq!(token.balance(&contract_id), 300);
+    assert_eq!(token.balance(&provider), 700);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_gas_buffer_withdrawal_below_minimum() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&provider, &1000);
+
+    // Initialize gas buffer with minimum amount
+    client.initialize_gas_buffer(&provider, &token_address, &100);
+    
+    // Try to withdraw entire buffer (would go below minimum)
+    client.withdraw_from_gas_buffer(&provider, &token_address, &50);
+}
+
+#[test]
+fn test_claim_with_gas_buffer() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    let oracle = Address::generate(&env);
+    client.set_oracle(&oracle);
+
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = token::Client::new(&env, &token_address);
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+    token_admin_client.mint(&provider, &1000);
+
+    // Initialize gas buffer for provider
+    client.initialize_gas_buffer(&provider, &token_address, &500);
+
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address);
+    client.top_up(&meter_id, &500);
+
+    env.ledger().set_timestamp(env.ledger().timestamp() + 5);
+    client.claim(&meter_id);
+
+    let meter = client.get_meter(&meter_id).unwrap();
+    assert_eq!(meter.balance, 450);
+    assert_eq!(token.balance(&provider), 550); // 50 from claim + 500 initial gas buffer
+    assert_eq!(token.balance(&contract_id), 450);
+    
+    // Check that gas buffer was used (balance should be reduced)
+    let gas_buffer = client.get_gas_buffer(&provider).unwrap();
+    assert_eq!(gas_buffer.balance, 400); // 500 - 100 (MIN_GAS_BUFFER)
+}
+
+#[test]
+fn test_get_gas_buffer_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let provider = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&provider, &1000);
+
+    // Check balance before initialization
+    assert_eq!(client.get_gas_buffer_balance(&provider), 0);
+
+    // Initialize gas buffer
+    client.initialize_gas_buffer(&provider, &token_address, &300);
+    
+    // Check balance after initialization
+    assert_eq!(client.get_gas_buffer_balance(&provider), 300);
+}

@@ -50,11 +50,21 @@ pub struct ProviderWithdrawalWindow {
 }
 
 #[contracttype]
+#[derive(Clone)]
+pub struct GasBuffer {
+    pub balance: i128,
+    pub last_top_up: u64,
+    pub provider: Address,
+    pub token: Address,
+}
+
+#[contracttype]
 pub enum DataKey {
     Meter(u64),
     ProviderWindow(Address),
     Count,
     Oracle,
+    GasBuffer(Address),
 }
 
 #[contracterror]
@@ -64,6 +74,7 @@ pub enum ContractError {
     MeterNotFound = 1,
     OracleNotSet = 2,
     WithdrawalLimitExceeded = 3,
+    InsufficientGasBuffer = 4,
 }
 
 #[contract]
@@ -72,6 +83,11 @@ pub struct UtilityContract;
 const HOUR_IN_SECONDS: u64 = 60 * 60;
 const DAY_IN_SECONDS: u64 = 24 * HOUR_IN_SECONDS;
 const DAILY_WITHDRAWAL_PERCENT: i128 = 10;
+
+// Gas buffer constants
+const MIN_GAS_BUFFER: i128 = 100;      // Minimum XLM to maintain as gas buffer
+const MAX_GAS_BUFFER: i128 = 10000;    // Maximum XLM that can be stored in gas buffer
+const GAS_BUFFER_TOP_UP_THRESHOLD: i128 = 200;  // Auto-top up when buffer falls below this
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -171,6 +187,47 @@ fn get_provider_total_pool(env: &Env, provider: &Address) -> i128 {
     total_pool
 }
 
+fn get_gas_buffer_or_default(env: &Env, provider: &Address, token: &Address) -> GasBuffer {
+    env.storage()
+        .instance()
+        .get(&DataKey::GasBuffer(provider.clone()))
+        .unwrap_or(GasBuffer {
+            balance: 0,
+            last_top_up: 0,
+            provider: provider.clone(),
+            token: token.clone(),
+        })
+}
+
+fn update_gas_buffer(env: &Env, gas_buffer: &GasBuffer) {
+    env.storage()
+        .instance()
+        .set(&DataKey::GasBuffer(gas_buffer.provider.clone()), gas_buffer);
+}
+
+fn should_use_gas_buffer(env: &Env, provider: &Address, amount: i128) -> bool {
+    // Check if provider has a gas buffer with sufficient balance
+    if let Some(gas_buffer) = env.storage().instance().get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider.clone())) {
+        // Use gas buffer if regular transfer might fail due to high fees
+        // This is a simplified heuristic - in production, you'd want to check actual network fees
+        gas_buffer.balance >= MIN_GAS_BUFFER && amount > 0
+    } else {
+        false
+    }
+}
+
+fn deduct_from_gas_buffer(env: &Env, provider: &Address, amount: i128) -> Result<(), ContractError> {
+    let mut gas_buffer = get_gas_buffer_or_default(env, provider, &Address::generate(env)); // Token address not needed for gas buffer
+    
+    if gas_buffer.balance < amount {
+        return Err(ContractError::InsufficientGasBuffer);
+    }
+    
+    gas_buffer.balance = gas_buffer.balance.saturating_sub(amount);
+    update_gas_buffer(env, &gas_buffer);
+    Ok(())
+}
+
 fn apply_provider_withdrawal_limit(
     env: &Env,
     provider: &Address,
@@ -202,7 +259,30 @@ fn apply_provider_claim(env: &Env, meter: &mut Meter, amount: i128) {
     }
 
     let client = token::Client::new(env, &meter.token);
-    client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+    
+    // Check if we should use gas buffer for this transfer
+    if should_use_gas_buffer(env, &meter.provider, amount) {
+        // Use gas buffer to ensure transaction succeeds during high fee periods
+        // In a real implementation, this would involve more complex fee estimation
+        // For now, we'll still do the transfer but mark it as gas-buffer-supported
+        match deduct_from_gas_buffer(env, &meter.provider, MIN_GAS_BUFFER) {
+            Ok(()) => {
+                // Gas buffer deduction successful, proceed with transfer
+                client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+                
+                // Emit event indicating gas buffer was used
+                env.events()
+                    .publish((symbol_short!("GasBufferUsed"), meter.provider.clone()), amount);
+            }
+            Err(_) => {
+                // Insufficient gas buffer, attempt regular transfer
+                client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+            }
+        }
+    } else {
+        // No gas buffer or not needed, use regular transfer
+        client.transfer(&env.current_contract_address(), &meter.provider, &amount);
+    }
 
     match meter.billing_type {
         BillingType::PrePaid => {
@@ -496,6 +576,95 @@ impl UtilityContract {
             }
             None => true,
         }
+    }
+
+    // Gas Buffer Management Functions
+    
+    pub fn initialize_gas_buffer(env: Env, provider: Address, token: Address, initial_amount: i128) {
+        provider.require_auth();
+        
+        if initial_amount < MIN_GAS_BUFFER || initial_amount > MAX_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let now = env.ledger().timestamp();
+        let gas_buffer = GasBuffer {
+            balance: initial_amount,
+            last_top_up: now,
+            provider: provider.clone(),
+            token: token.clone(),
+        };
+        
+        // Transfer initial amount from provider to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&provider, &env.current_contract_address(), &initial_amount);
+        
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferInit"), provider), initial_amount);
+    }
+    
+    pub fn top_up_gas_buffer(env: Env, provider: Address, token: Address, amount: i128) {
+        provider.require_auth();
+        
+        let mut gas_buffer = get_gas_buffer_or_default(&env, &provider, &token);
+        
+        if gas_buffer.balance.saturating_add(amount) > MAX_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let now = env.ledger().timestamp();
+        
+        // Transfer top-up amount from provider to contract
+        let client = token::Client::new(&env, &token);
+        client.transfer(&provider, &env.current_contract_address(), &amount);
+        
+        gas_buffer.balance = gas_buffer.balance.saturating_add(amount);
+        gas_buffer.last_top_up = now;
+        
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferTopUp"), provider), amount);
+    }
+    
+    pub fn withdraw_from_gas_buffer(env: Env, provider: Address, token: Address, amount: i128) {
+        provider.require_auth();
+        
+        let mut gas_buffer = get_gas_buffer_or_default(&env, &provider, &token);
+        
+        if gas_buffer.balance < amount {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        // Ensure minimum buffer is maintained
+        if gas_buffer.balance.saturating_sub(amount) < MIN_GAS_BUFFER {
+            panic_with_error!(env, ContractError::InsufficientGasBuffer);
+        }
+        
+        let client = token::Client::new(&env, &token);
+        client.transfer(&env.current_contract_address(), &provider, &amount);
+        
+        gas_buffer.balance = gas_buffer.balance.saturating_sub(amount);
+        update_gas_buffer(&env, &gas_buffer);
+        
+        env.events()
+            .publish((symbol_short!("GasBufferWithdraw"), provider), amount);
+    }
+    
+    pub fn get_gas_buffer(env: Env, provider: Address) -> Option<GasBuffer> {
+        env.storage()
+            .instance()
+            .get(&DataKey::GasBuffer(provider))
+    }
+    
+    pub fn get_gas_buffer_balance(env: Env, provider: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get::<DataKey, GasBuffer>(&DataKey::GasBuffer(provider))
+            .map(|buffer| buffer.balance)
+            .unwrap_or(0)
     }
 }
 
