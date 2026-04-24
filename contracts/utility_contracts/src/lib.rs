@@ -418,68 +418,15 @@ pub struct WithdrawalRequest {
 
 #[contracttype]
 #[derive(Clone)]
-pub struct StreamUpdatedEvent {
-    pub stream_id: u64,
-    pub old_flow_rate: i128,
-    pub new_flow_rate: i128,
-    pub timestamp: u64,
-    pub old_status: StreamStatus,
-    pub new_status: StreamStatus,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct StreamPausedEvent {
-    pub stream_id: u64,
-    pub paused_at: u64,
-    pub provider: Address,
-    pub remaining_balance: i128,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct StreamResumedEvent {
-    pub stream_id: u64,
-    pub resumed_at: u64,
-    pub provider: Address,
-    pub flow_rate_per_second: i128,
-    pub pause_duration: u64,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct BufferWarningEvent {
-    pub stream_id: u64,
-    pub warning_timestamp: u64,
-    pub buffer_remaining: i128,
-    pub provider: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct BufferDepletedEvent {
-    pub stream_id: u64,
-    pub depleted_timestamp: u64,
-    pub buffer_consumed: i128,
-    pub provider: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct DustCollectedEvent {
-    pub token_address: Address,
-    pub total_dust_swept: i128,
-    pub streams_swept: u64,
-    pub timestamp: u64,
-    pub sweeper_address: Address,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct DustAggregation {
-    pub total_dust: i128,
-    pub stream_count: u64,
-    pub last_updated: u64,
+pub struct FeeChangeProposal {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: i128,
+    pub proposed_at: u64,
+    pub voting_deadline: u64,
+    pub votes_for: i128,
+    pub votes_against: i128,
+    pub is_executed: bool,
+    pub proposer: Address,
 }
 
 #[contracttype]
@@ -501,13 +448,47 @@ pub enum DataKey {
     Referral(Address),
     PollVotes(Symbol),
     UserVoted(Address, Symbol),
-    Admin,
-    Role(Address),
-    NonReentrant,
-    IdentityContract,
-    Dispute(u64),
-    DisputeCount,
-    DisputeBondAmount,
+    BillingGroup(Address),
+    WebhookConfig(Address),
+    LastAlert(u64),
+    ClosingFeeBps,
+    Contributor(u64, Address),
+    AuthorizedContributor(u64, Address),
+    // Task #2: Tax Compliance
+    GovernmentVault(Address),
+    TaxRateBps, // Tax rate in basis points (e.g., 500 = 5%)
+    // Task #3: Self-Maintenance
+    MaintenanceFund(u64), // Per-meter maintenance fund balance
+    AutoExtendThreshold, // Ledger threshold for auto-extension
+    // Task #4: Wasm Hash Rotation
+    ProposedUpgrade,
+    UpgradeProposalTime,
+    VetoDeadline,
+    UserVetoed(Address, u64), // Address and proposal ID
+    // NEW TASKS:
+    // Task #1: Admin Transfer
+    CurrentAdmin,
+    AdminTransferProposal,
+    AdminVeto(Address, u64), // Address and proposal timestamp
+    ActiveUsers, // For tracking active users for voting
+    // Task #2: Legal Freeze
+    ComplianceOfficer,
+    ComplianceCouncil,
+    LegalFreeze(u64),
+    LegalVault,
+    // Task #3: Verified Provider Registry
+    VerifiedProvider(Address),
+    // Task #4: Sub-DAO
+    SubDaoConfig(Address),
+    // Issue #98: Multi-Sig Provider Withdrawal
+    MultiSigConfig(Address),           // Provider address -> MultiSigConfig
+    WithdrawalRequest(Address, u64),   // Provider address, request ID -> WithdrawalRequest
+    WithdrawalRequestCount(Address),   // Provider address -> request counter
+    WithdrawalApproval(Address, u64, Address), // Provider, request ID, signer -> bool
+    // Task #104: Usage-Based Governance
+    FeeChangeProposal(u64),
+    FeeChangeVote(Address, u64),
+    FeeProposalCount,
 }
 
 #[contracterror]
@@ -531,15 +512,66 @@ pub enum ContractError {
     MeterNotPaired = 15,
     MeterPaused = 16,
     AlreadyVoted = 17,
-    Unauthorized = 18,
-    KycRequired = 19,
-    ReentrancyForbidden = 20,
-    DisputeNotFound = 21,
-    DisputeAlreadyResolved = 22,
-    InsufficientBond = 23,
-    AccountAlreadyClosed = 24,
-    InsufficientBalance = 25,
-    InvalidClosingFee = 26,
+    InvalidClosingFee = 18,
+    AccountAlreadyClosed = 19,
+    InsufficientBalance = 20,
+    UnauthorizedContributor = 21,
+    InDispute = 22,
+    ChallengeActive = 23,
+    NotAnOracle = 24,
+    // Task #1: Priority System Errors
+    ThrottlingThresholdExceeded = 25,
+    LowPriorityStreamPaused = 26,
+    // Task #2: Tax Compliance Errors
+    GovernmentVaultNotSet = 27,
+    TaxCalculationFailed = 28,
+    // Task #3: Maintenance Errors
+    MaintenanceFundInsufficient = 29,
+    TTLExtensionFailed = 30,
+    // Task #4: Upgrade Errors
+    UpgradeProposalActive = 31,
+    VetoPeriodExpired = 32,
+    UserVetoedProposal = 33,
+    InvalidWasmHash = 34,
+    // NEW TASKS:
+    // Task #1: Admin Transfer Errors
+    AdminTransferActive = 35,
+    NoAdminTransferInProgress = 36,
+    VetoThresholdNotReached = 37,
+    AdminExecutionWindowExpired = 38,
+    NotCurrentAdmin = 39,
+    // Task #2: Legal Freeze Errors
+    NotComplianceOfficer = 40,
+    MeterNotFrozen = 41,
+    LegalFreezeAlreadyActive = 42,
+    ComplianceCouncilApprovalRequired = 43,
+    // Task #3: Verified Provider Errors
+    ProviderNotVerified = 44,
+    VerificationAlreadyGranted = 45,
+    // Task #4: Sub-DAO Errors
+    NotParentDao = 46,
+    SubDaoBudgetExceeded = 47,
+    SubDaoNotConfigured = 48,
+    // Issue #98: Multi-Sig Withdrawal Errors
+    MultiSigNotConfigured = 49,
+    MultiSigAlreadyConfigured = 50,
+    InvalidFinanceWalletCount = 51,
+    InvalidSignatureThreshold = 52,
+    NotAuthorizedFinanceWallet = 53,
+    WithdrawalRequestNotFound = 54,
+    WithdrawalRequestExpired = 55,
+    WithdrawalAlreadyExecuted = 56,
+    WithdrawalAlreadyCancelled = 57,
+    InsufficientApprovals = 58,
+    AlreadyApprovedWithdrawal = 59,
+    NotApprovedByWallet = 60,
+    AmountBelowMultiSigThreshold = 61,
+    MultiSigRequiredForAmount = 62,
+    // Task #104: Usage-Based Governance
+    FeeProposalNotFound = 63,
+    FeeProposalVotingEnded = 64,
+    FeeProposalNotReady = 65,
+    FeeProposalAlreadyExecuted = 66,
 }
 
 #[contracttype]
@@ -5753,6 +5785,98 @@ env.storage()
         } else {
             false
         }
+    }
+
+    // ============================================================================
+    // Task #104: Usage-Based Governance (Proportional Voter Weight)
+    // ============================================================================
+    
+    pub fn propose_fee_change(env: Env, proposer: Address, proposed_fee_bps: i128) -> u64 {
+        proposer.require_auth();
+
+        let proposal_id: u64 = env.storage().instance().get(&DataKey::FeeProposalCount).unwrap_or(0);
+        let next_proposal_id = proposal_id + 1;
+        env.storage().instance().set(&DataKey::FeeProposalCount, &next_proposal_id);
+
+        let now = env.ledger().timestamp();
+        let proposal = FeeChangeProposal {
+            proposal_id: next_proposal_id,
+            proposed_fee_bps,
+            proposed_at: now,
+            voting_deadline: now + (7 * DAY_IN_SECONDS),
+            votes_for: 0,
+            votes_against: 0,
+            is_executed: false,
+            proposer: proposer.clone(),
+        };
+
+        env.storage().instance().set(&DataKey::FeeChangeProposal(next_proposal_id), &proposal);
+        
+        env.events().publish((symbol_short!("FeeProp"), next_proposal_id), proposed_fee_bps);
+        
+        next_proposal_id
+    }
+
+    pub fn vote_for_fee_change(env: Env, meter_id: u64, proposal_id: u64, support: bool) {
+        let meter = get_meter_or_panic(&env, meter_id);
+        meter.user.require_auth();
+
+        let mut proposal: FeeChangeProposal = env.storage().instance()
+            .get(&DataKey::FeeChangeProposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::FeeProposalNotFound));
+
+        if env.ledger().timestamp() > proposal.voting_deadline {
+            panic_with_error!(&env, ContractError::FeeProposalVotingEnded);
+        }
+
+        let vote_key = DataKey::FeeChangeVote(meter.user.clone(), proposal_id);
+        if env.storage().instance().has(&vote_key) {
+            panic_with_error!(&env, ContractError::AlreadyVoted);
+        }
+
+        // Calculate voting weight based on monthly volume as a proxy for the last 6 months.
+        let voting_weight = meter.usage_data.monthly_volume.saturating_mul(6);
+
+        if support {
+            proposal.votes_for = proposal.votes_for.saturating_add(voting_weight);
+        } else {
+            proposal.votes_against = proposal.votes_against.saturating_add(voting_weight);
+        }
+
+        env.storage().instance().set(&DataKey::FeeChangeProposal(proposal_id), &proposal);
+        env.storage().instance().set(&vote_key, &true);
+
+        env.events().publish(
+            (symbol_short!("FeeVote"), proposal_id),
+            (meter.user, support, voting_weight)
+        );
+    }
+
+    pub fn execute_fee_change(env: Env, proposal_id: u64) {
+        let mut proposal: FeeChangeProposal = env.storage().instance()
+            .get(&DataKey::FeeChangeProposal(proposal_id))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::FeeProposalNotFound));
+
+        if env.ledger().timestamp() <= proposal.voting_deadline {
+            panic_with_error!(&env, ContractError::FeeProposalNotReady);
+        }
+
+        if proposal.is_executed {
+            panic_with_error!(&env, ContractError::FeeProposalAlreadyExecuted);
+        }
+
+        // Simple majority logic
+        if proposal.votes_for > proposal.votes_against {
+            env.storage().instance().set(&DataKey::ProtocolFeeBps, &proposal.proposed_fee_bps);
+        }
+
+        proposal.is_executed = true;
+        env.storage().instance().set(&DataKey::FeeChangeProposal(proposal_id), &proposal);
+
+        env.events().publish(
+            (symbol_short!("FeeExec"), proposal_id),
+            (proposal.proposed_fee_bps, proposal.votes_for > proposal.votes_against)
+        );
     }
 }
 
