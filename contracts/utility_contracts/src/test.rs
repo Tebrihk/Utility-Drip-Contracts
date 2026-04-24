@@ -3,6 +3,35 @@
 use super::*;
 use soroban_sdk::testutils::{Address as _, Ledger};
 use soroban_sdk::{Address, Env};
+use utility_contracts::UtilityContractClient;
+
+#[test]
+fn test_initialization() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let root_admin = Address::generate(&env);
+    
+    // Test initial state
+    assert_eq!(client.is_initialized(), false);
+    assert_eq!(client.get_root_admin(), None);
+    
+    // Initialize contract
+    client.initialize(&root_admin);
+    
+    // Test post-initialization state
+    assert_eq!(client.is_initialized(), true);
+    assert_eq!(client.get_root_admin(), Some(root_admin.clone()));
+    
+    // Test double initialization fails
+    let result = std::panic::catch_unwind(|| {
+        client.initialize(&root_admin);
+    });
+    assert!(result.is_err());
+}
 
 #[test]
 fn test_utility_flow() {
@@ -26,7 +55,7 @@ fn test_utility_flow() {
 
     // 1. Register Meter
     let rate = 10; // 10 tokens per second
-    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address, &None);
     assert_eq!(meter_id, 1);
 
     let meter = client.get_meter(&meter_id).unwrap();
@@ -85,7 +114,7 @@ fn test_max_flow_rate_cap() {
 
     // Register Meter with high rate
     let rate = 100; // 100 tokens per second
-    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address, &None);
     
     // Set a low max flow rate cap
     client.set_max_flow_rate(&meter_id, &5000); // 5000 tokens per hour max
@@ -123,7 +152,7 @@ fn test_calculate_expected_depletion() {
 
     // Register Meter
     let rate = 10; // 10 tokens per second
-    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address, &None);
     client.top_up(&meter_id, &500);
     
     // Calculate depletion time
@@ -154,7 +183,7 @@ fn test_emergency_shutdown() {
 
     // Register and top up meter
     let rate = 10;
-    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address, &None);
     client.top_up(&meter_id, &500);
     
     // Verify meter is active
@@ -189,7 +218,7 @@ fn test_heartbeat_functionality() {
 
     // Register meter
     let rate = 10;
-    let meter_id = client.register_meter(&user, &provider, &rate, &token_address);
+    let meter_id = client.register_meter(&user, &provider, &rate, &token_address, &None);
     
     // Initially should not be offline
     assert_eq!(client.is_meter_offline(&meter_id), false);
@@ -205,4 +234,48 @@ fn test_heartbeat_functionality() {
     
     // Should no longer be offline
     assert_eq!(client.is_meter_offline(&meter_id), false);
+}
+
+#[test]
+fn test_event_emissions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(UtilityContract, ());
+    let client = UtilityContractClient::new(&env, &contract_id);
+
+    let root_admin = Address::generate(&env);
+    
+    // Test initialization event
+    client.initialize(&root_admin);
+    
+    let user = Address::generate(&env);
+    let provider = Address::generate(&env);
+    
+    // Setup a token
+    let token_admin = Address::generate(&env);
+    let token_address = env.register_stellar_asset_contract(token_admin.clone());
+    let token_admin_client = token::StellarAssetClient::new(&env, &token_address);
+
+    token_admin_client.mint(&user, &1000);
+
+    // Test meter registration event
+    let meter_id = client.register_meter(&user, &provider, &10, &token_address, &None);
+    
+    // Test top-up event
+    client.top_up(&meter_id, &500);
+    
+    // Test claim event
+    env.ledger().set_timestamp(env.ledger().timestamp() + 10);
+    client.claim(&meter_id);
+    
+    // Test webhook configuration event
+    let webhook_url_hash = 12345u64; // Simple hash for testing
+    client.configure_webhook(&user, &webhook_url_hash);
+    
+    // Test emergency shutdown event
+    client.emergency_shutdown(&meter_id);
+    
+    // Note: In a real test environment, you would verify the events were emitted
+    // This test ensures the functions execute without panicking when events are published
 }

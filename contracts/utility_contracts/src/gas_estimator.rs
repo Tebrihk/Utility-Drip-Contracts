@@ -19,7 +19,7 @@ impl GasCostEstimator {
     pub fn estimate_meter_monthly_cost(
         _env: &Env,
         is_group_meter: bool,
-        meters_in_group: u32,
+        _meters_in_group: u32,
     ) -> i128 {
         let mut monthly_cost = Self::REGISTER_METER; // One-time registration
         
@@ -117,18 +117,6 @@ pub struct LargeScaleCostEstimate {
 }
 
 impl LargeScaleCostEstimate {
-    pub fn get_summary(&self) -> String {
-        format!(
-            "Cost Analysis for {} meters:\n\
-             Monthly: {} XLM ({} per meter)\n\
-             Annual: {} XLM ({} per meter)\n\
-             Group Billing: {}",
-            self.number_of_meters,
-            self.monthly_cost_xlm,
-            self.cost_per_meter_xlm,
-            self.annual_cost_xlm,
-            self.cost_per_meter_xlm,
-            if self.group_billing_enabled { "Enabled" } else { "Disabled" }
-        )
-    }
+    // Note: String formatting not supported in Soroban contracts
+    // This would be implemented off-chain or returned as separate fields
 }
