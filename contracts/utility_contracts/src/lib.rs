@@ -15,11 +15,6 @@ pub trait PriceOracle {
     fn get_price(env: Env) -> PriceData;
 }
 
-#[contractclient(name = "IdentityRegistryClient")]
-pub trait IdentityRegistry {
-    fn is_verified(env: Env, account: Address) -> bool;
-}
-
 #[contracttype]
 #[derive(Clone)]
 pub struct PriceData {
@@ -49,28 +44,27 @@ pub enum BillingType {
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum Role {
-    SuperAdmin = 1,
-    Provider = 2,
-    Auditor = 3,
+pub enum StreamStatus {
+    Active = 0,
+    Paused = 1,
+    Depleted = 2,
 }
 
 #[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum DisputeStatus {
-    Open = 1,
-    ResolvedInFavorOfPayer = 2,
-    ResolvedInFavorOfProvider = 3,
-}
-
-#[contracttype]
-#[derive(Clone)]
-pub struct Dispute {
-    pub meter_id: u64,
-    pub amount: i128,
-    pub bond: i128,
-    pub status: DisputeStatus,
-    pub raised_at: u64,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContinuousFlow {
+    // Tightly packed struct for optimal storage
+    pub stream_id: u64,           // 8 bytes
+    pub flow_rate_per_second: i128, // 16 bytes - micro-stroops per second
+    pub accumulated_balance: i128,  // 16 bytes - precise balance tracking
+    pub last_flow_timestamp: u64,   // 8 bytes - u64 for epoch safety
+    pub created_timestamp: u64,     // 8 bytes - creation time
+    pub status: StreamStatus,       // 1 byte (enum)
+    pub paused_at: u64,           // 8 bytes - timestamp when stream was paused (0 if active)
+    pub provider: Address,         // 32 bytes - provider address for access control
+    pub buffer_balance: i128,     // 16 bytes - pre-paid buffer balance (24 hours of flow)
+    pub buffer_warning_sent: bool, // 1 byte - whether buffer warning has been sent
+    pub payer: Address,           // 32 bytes - payer address for buffer refunds
 }
 // Minimum balance required to keep the IoT relay open (500 tokens for testing)
 const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
@@ -498,16 +492,11 @@ pub enum DataKey {
     SupportedToken(Address),
     SupportedWithdrawalToken(Address),
     ProviderTotalPool(Address),
-    Referral(Address),
-    PollVotes(Symbol),
-    UserVoted(Address, Symbol),
-    Admin,
-    Role(Address),
-    NonReentrant,
-    IdentityContract,
-    Dispute(u64),
-    DisputeCount,
-    DisputeBondAmount,
+    ContinuousFlow(u64),
+    DustAggregation(Address),
+    AdminAddress,
+    GasBountyPool,
+    BufferVault(u64), // Per-stream buffer vault tracking
 }
 
 #[contracterror]
@@ -529,17 +518,12 @@ pub enum ContractError {
     ChallengeNotFound = 13,
     InvalidPairingSignature = 14,
     MeterNotPaired = 15,
-    MeterPaused = 16,
-    AlreadyVoted = 17,
-    Unauthorized = 18,
-    KycRequired = 19,
-    ReentrancyForbidden = 20,
-    DisputeNotFound = 21,
-    DisputeAlreadyResolved = 22,
-    InsufficientBond = 23,
-    AccountAlreadyClosed = 24,
-    InsufficientBalance = 25,
-    InvalidClosingFee = 26,
+    UnauthorizedAdmin = 16,
+    InsufficientGasBounty = 17,
+    NoDustToSweep = 18,
+    InsufficientBuffer = 19,
+    BufferAlreadyDepleted = 20,
+    UnauthorizedBufferAccess = 21,
 }
 
 #[contracttype]
@@ -566,56 +550,15 @@ const PEAK_HOUR_START: u64 = 18 * HOUR_IN_SECONDS; // 64800 seconds
 const PEAK_HOUR_END: u64 = 21 * HOUR_IN_SECONDS; // 75600 seconds
 const PEAK_RATE_MULTIPLIER: i128 = 3; // 1.5x => stored as 3 (divide by 2)
 const RATE_PRECISION: i128 = 2; // Precision for rate calculations
-const REFERRAL_REWARD_UNITS: i128 = 500; // 5 units reward for referrals
-const DEFAULT_GREEN_ENERGY_DISCOUNT_BPS: i128 = 500; // 5% default discount
 
 // XLM precision constants - XLM has 7 decimal places (0.0000001 minimum)
 const XLM_PRECISION: i128 = 10_000_000; // 10^7 for 7 decimal places
 const XLM_MINIMUM_INCREMENT: i128 = 1; // 1 stroop = 0.0000001 XLM
 
-/// RBAC Helpers
-fn has_role(env: &Env, address: &Address, role: Role) -> bool {
-    let stored_role = env
-        .storage()
-        .instance()
-        .get::<DataKey, Role>(&DataKey::Role(address.clone()));
-    match stored_role {
-        Some(r) => r == role,
-        None => false,
-    }
-}
-
-fn require_role(env: &Env, address: &Address, role: Role) {
-    if !has_role(env, address, role) {
-        panic_with_error!(env, ContractError::Unauthorized);
-    }
-}
-
-fn is_super_admin(env: &Env, address: &Address) -> bool {
-    match env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
-        Some(admin) => &admin == address,
-        None => false,
-    }
-}
-
-fn require_super_admin(env: &Env, address: &Address) {
-    address.require_auth();
-    if !is_super_admin(env, address) {
-        panic_with_error!(env, ContractError::Unauthorized);
-    }
-}
-
-/// Reentrancy Guard Helpers
-fn lock_reentrancy(env: &Env) {
-    if env.storage().temporary().has(&DataKey::NonReentrant) {
-        panic_with_error!(env, ContractError::ReentrancyForbidden);
-    }
-    env.storage().temporary().set(&DataKey::NonReentrant, &true);
-}
-
-fn unlock_reentrancy(env: &Env) {
-    env.storage().temporary().remove(&DataKey::NonReentrant);
-}
+// Dust detection constants
+const DUST_THRESHOLD: i128 = 1; // Less than 1 stroop is considered dust
+const GAS_BOUNTY_AMOUNT: i128 = 100_000; // 0.01 XLM bounty for dust sweepers
+const MAX_SWEEP_STREAMS_PER_CALL: u64 = 1000; // Prevent gas limit issues
 
 /// Round XLM amount to nearest minimum increment (0.0000001 XLM)
 /// This prevents value loss over time due to truncation
@@ -734,21 +677,30 @@ fn settle_claim_for_meter(
         return ClaimSettlement { gross_claimed: 0, provider_payout: 0, tax_amount: 0, protocol_fee: 0, reseller_payout: 0 };
     }
 
-/// KYC Helpers
-fn check_kyc(env: &Env, account: &Address) {
-    if let Some(identity_address) = env.storage().instance().get::<DataKey, Address>(&DataKey::IdentityContract) {
-        let identity_client = IdentityRegistryClient::new(env, &identity_address);
-        if !identity_client.is_verified(account) {
-            panic_with_error!(env, ContractError::KycRequired);
-        }
-    }
-}
+    // 1. Tax Calculation
+    let tax_rate = env.storage().instance().get(&DataKey::TaxRateBps).unwrap_or(DEFAULT_TAX_RATE_BPS);
+    let tax_amt = (claimable * tax_rate) / 10000;
+    let after_tax = claimable - tax_amt;
 
-/// Checks if an address represents the native Stellar asset (XLM)
-fn is_native_token(_token_address: &Address) -> bool {
-    // Simplify for consistency with other SAC-compliant tokens.
-    true
-}
+    // 2. Protocol Fee
+    let protocol_bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+    let protocol_fee = (after_tax * protocol_bps) / 10000;
+    let after_protocol = after_tax - protocol_fee;
+
+    // 3. Reseller Split
+    let reseller_payout = get_reseller_cut(env, meter_id, after_protocol);
+    let provider_payout = after_protocol - reseller_payout;
+
+    meter.balance -= claimable;
+    meter.last_update = now;
+
+    ClaimSettlement {
+        gross_claimed: claimable,
+        provider_payout,
+        tax_amount: tax_amt,
+        protocol_fee,
+        reseller_payout,
+    };
 
     // Calculate total value (balance + debt if postpaid)
     let total_value = match meter.billing_type {
@@ -927,100 +879,42 @@ fn get_reseller_cut(env: &Env, meter_id: u64, amount: i128) -> i128 {
     }
 }
 
-    pub fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(env, ContractError::Unauthorized);
-        }
-        env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::DisputeBondAmount, &100_000_000i128); // 10 XLM default bond
-    }
+fn publish_active_event(env: &Env, meter_id: u64, timestamp: u64) {
+    env.events().publish(
+        (symbol_short!("Active"), meter_id),
+        timestamp,
+    );
+}
 
-    pub fn transfer_admin(env: Env, admin: Address, new_admin: Address) {
-        require_super_admin(&env, &admin);
-        // Requirement: "only a multi-sig can change a SuperAdmin"
-        // On Stellar, this is usually enforced by the account configuration.
-        // We ensure the current admin authorizes the transfer.
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.events().publish((symbol_short!("AdmTrans"), admin), new_admin);
-    }
+// Task #3: Self-Maintenance Helper Functions
+fn allocate_to_maintenance_fund(env: &Env, meter_id: u64, amount: i128) {
+    let maintenance_amount = (amount * MAINTENANCE_FUND_PERCENT_BPS) / 10_000;
 
-    pub fn set_role(env: Env, admin: Address, account: Address, role: Role) {
-        require_super_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::Role(account), &role);
-    }
-
-    pub fn set_identity_contract(env: Env, admin: Address, identity_contract: Address) {
-        require_super_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::IdentityContract, &identity_contract);
-    }
-
-    pub fn set_oracle(env: Env, admin: Address, oracle_address: Address) {
-        require_super_admin(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Oracle, &oracle_address);
-    }
-
-    pub fn set_maintenance_config(env: Env, admin: Address, wallet: Address, fee_bps: i128) {
-        require_super_admin(&env, &admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::MaintenanceWallet, &wallet);
-        env.storage()
-            .instance()
-            .set(&DataKey::ProtocolFeeBps, &fee_bps);
-    }
-
-    pub fn add_supported_token(env: Env, admin: Address, token: Address) {
-        require_super_admin(&env, &admin);
-        env.storage()
+    if maintenance_amount > 0 {
+        let current_fund: i128 = env
+            .storage()
             .instance()
             .get(&DataKey::MaintenanceFund(meter_id))
             .unwrap_or(0);
 
-    pub fn remove_supported_token(env: Env, admin: Address, token: Address) {
-        require_super_admin(&env, &admin);
+        let new_fund = current_fund.saturating_add(maintenance_amount);
         env.storage()
             .instance()
-            .set(&DataKey::SupportedToken(token), &false);
-    }
-
-    pub fn add_supported_withdrawal_token(env: Env, admin: Address, token: Address) {
-        require_super_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &true);
+            .set(&DataKey::MaintenanceFund(meter_id), &new_fund);
     }
 }
 
-    pub fn remove_supported_withdrawal_token(env: Env, admin: Address, token: Address) {
-        require_super_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &false);
-    }
+fn get_reseller_config_impl(env: &Env, meter_id: u64) -> Option<ResellerConfig> {
+    env.storage().instance().get(&DataKey::ResellerConfig(meter_id))
+}
 
-    pub fn set_closing_fee(env: Env, admin: Address, fee_bps: i128) {
-        require_super_admin(&env, &admin);
-        if fee_bps < 0 || fee_bps > 1000 {
-            panic_with_error!(env, ContractError::InvalidClosingFee);
-        }
-        env.storage().instance().set(&DataKey::ClosingFeeBps, &fee_bps);
-    }
-
-    pub fn set_dispute_bond(env: Env, admin: Address, amount: i128) {
-        require_super_admin(&env, &admin);
-        env.storage().instance().set(&DataKey::DisputeBondAmount, &amount);
-    }
-
-    /// Set green energy discount for a specific meter (in basis points)
-    pub fn set_green_energy_discount(env: Env, meter_id: u64, discount_bps: i128) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
-        
-        if discount_bps < 0 || discount_bps > 10000 {
-            panic_with_error!(&env, ContractError::InvalidUsageValue);
-        }
-        
-        meter.green_energy_discount_bps = discount_bps;
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-    }
+fn auto_extend_ttl_if_needed(env: &Env, meter_id: u64) {
+    let ledger_sequence = env.ledger().sequence();
+    let threshold: u32 = env
+        .storage()
+        .instance()
+        .get(&DataKey::AutoExtendThreshold)
+        .unwrap_or(AUTO_EXTEND_LEDGER_THRESHOLD);
 
     // Check if we need to extend (every 500,000 ledgers)
     if ledger_sequence % threshold as u32 == 0 {
@@ -1047,17 +941,10 @@ fn get_reseller_cut(env: &Env, meter_id: u64, amount: i128) -> i128 {
     }
 }
 
-    pub fn register_meter_with_mode(
-        env: Env,
-        user: Address,
-        provider: Address,
-        off_peak_rate: i128,
-        token: Address,
-        billing_type: BillingType,
-        device_public_key: BytesN<32>,
-    ) -> u64 {
-        user.require_auth();
-        check_kyc(&env, &user);
+// Task #4: Wasm Hash Rotation Helper Functions
+fn propose_upgrade_impl(env: &Env, new_wasm_hash: BytesN<32>, proposer: &Address) -> u64 {
+    let now = env.ledger().timestamp();
+    let veto_deadline = now.saturating_add(UPGRADE_VETO_PERIOD_SECONDS);
 
     let proposal = UpgradeProposal {
         new_wasm_hash: new_wasm_hash.clone(),
@@ -1113,11 +1000,9 @@ fn can_finalize_upgrade(env: &Env) -> bool {
         return true;
     }
 
-        // Require authorization and KYC for all users in the batch
-        for meter_info in meter_infos.iter() {
-            meter_info.user.require_auth();
-            check_kyc(&env, &meter_info.user);
-        }
+    let veto_bps = (veto_count * 10000) / (total_meters as i128);
+    veto_bps < VETO_THRESHOLD_BPS
+}
 
 #[contract]
 pub struct UtilityContract;
@@ -3750,8 +3635,8 @@ impl UtilityContract {
         env.storage().instance().get(&DataKey::Contributor(meter_id, contributor)).unwrap_or(0)
     }
 
-    pub fn top_up(env: Env, meter_id: u64, amount: i128) {
-        lock_reentrancy(&env);
+    // Task #88: Emergency Kill-Switch (Challenge)
+    pub fn challenge_service(env: Env, meter_id: u64) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
@@ -4154,7 +4039,6 @@ impl UtilityContract {
             (soroban_sdk::symbol_short!("AdminDone"),),
             (proposal.proposed_admin, now),
         );
-        unlock_reentrancy(&env);
     }
 
     /// Set current admin (initialization only)
@@ -4688,46 +4572,52 @@ env.storage()
             panic_with_error!(&env, ContractError::InvalidFinanceWalletCount);
         }
 
-    pub fn set_meter_pause(env: Env, meter_id: u64, paused: bool) {
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.user.require_auth();
-        meter.is_paused = paused;
-        let now = env.ledger().timestamp();
-        refresh_activity(&mut meter, now);
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        env.events().publish((symbol_short!("Paused"), meter_id), paused);
+let milestone = MaintenanceMilestone {
+            meter_id,
+            milestone_number,
+            description,
+            funding_amount,
+            is_completed: false,
+            completed_at: 0,
+            verified_by: verified_by.clone(),
+            completion_proof: Bytes::from_array(&env, &[0; 0]),
+        };
+
+        env.storage().instance().set(&DataKey::MultiSigConfig(provider.clone()), &updated_config);
+
+        env.events().publish(
+            (symbol_short!("MSigUpd"),),
+            (provider, new_required_signatures, new_threshold_amount),
+        );
     }
 
-    pub fn pause_stream(env: Env, provider: Address, meter_id: u64, paused: bool) {
-        require_role(&env, &provider, Role::Provider);
-        provider.require_auth();
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.is_paused = paused;
-        let now = env.ledger().timestamp();
-        refresh_activity(&mut meter, now);
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        env.events().publish((symbol_short!("ProvPause"), meter_id), paused);
-    }
+    /// Propose a multi-sig withdrawal request.
+    /// Only authorized Finance Department wallets can propose withdrawals.
+    ///
+    /// # Arguments
+    /// * `provider` - The utility provider address
+    /// * `meter_id` - The meter to withdraw earnings from
+    /// * `amount_usd_cents` - Amount to withdraw in USD cents
+    /// * `destination` - Treasury address to receive funds
+    ///
+    /// # Returns
+    /// The request ID for this withdrawal proposal
+    pub fn propose_multisig_withdrawal(
+        env: Env,
+        provider: Address,
+        meter_id: u64,
+        amount_usd_cents: i128,
+        destination: Address,
+    ) -> u64 {
+        let config: MultiSigConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultiSigConfig(provider.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::MultiSigNotConfigured));
 
-    pub fn override_limit(env: Env, auditor: Address, meter_id: u64, new_limit: i128) {
-        require_role(&env, &auditor, Role::Auditor);
-        auditor.require_auth();
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.max_flow_rate_per_hour = new_limit;
-        env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
-        env.events().publish((symbol_short!("Override"), meter_id), new_limit);
-    }
-
-    pub fn sweep(env: Env, admin: Address, token: Address, to: Address) {
-        require_super_admin(&env, &admin);
-        lock_reentrancy(&env);
-        let client = token::Client::new(&env, &token);
-        let balance = client.balance(&env.current_contract_address());
-        if balance > 0 {
-            client.transfer(&env.current_contract_address(), &to, &balance);
+        if !config.is_active {
+            panic_with_error!(&env, ContractError::MultiSigNotConfigured);
         }
-        unlock_reentrancy(&env);
-    }
 
         // Verify the meter belongs to this provider
         let meter = get_meter_or_panic(&env, meter_id);
@@ -4919,10 +4809,10 @@ env.storage()
             panic_with_error!(&env, ContractError::WithdrawalRequestExpired);
         }
 
-    pub fn withdraw_earnings(env: Env, meter_id: u64, amount_usd_cents: i128) {
-        lock_reentrancy(&env);
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
+        // Check sufficient approvals
+        if request.approval_count < config.required_signatures {
+            panic_with_error!(&env, ContractError::InsufficientApprovals);
+        }
 
         // Get meter and verify
         let mut meter = get_meter_or_panic(&env, request.meter_id);
@@ -4986,14 +4876,17 @@ env.storage()
             .instance()
             .set(&DataKey::Meter(request.meter_id), &meter);
 
-        // Emit conversion event if XLM was used
-        if is_native_token(&meter.token) {
-            env.events().publish(
-                (symbol_short!("USDtoXLM"), meter_id),
-                (amount_usd_cents, withdrawal_amount),
-            );
-        }
-        unlock_reentrancy(&env);
+        // Mark request as executed
+        request.is_executed = true;
+        env.storage().instance().set(
+            &DataKey::WithdrawalRequest(provider.clone(), request_id),
+            &request,
+        );
+
+        env.events().publish(
+            (symbol_short!("MSigExec"),),
+            (provider, request_id, request.amount_usd_cents, request.destination, withdrawal_amount),
+        );
     }
 
     /// Revoke a previously given approval for a withdrawal request.
@@ -5169,99 +5062,23 @@ env.storage()
         );
     }
 
-    /// Withdraw earnings with path payment support - allows provider to receive XLM
-    /// even when payments were made in USDC or other tokens
-    pub fn raise_dispute(env: Env, meter_id: u64, amount: i128) -> u64 {
-        let mut meter = get_meter_or_panic(&env, meter_id);
+    /// Disable privacy mode for a meter
+    pub fn disable_privacy_mode(env: Env, meter_id: u64) {
+        let meter = get_meter_or_panic(&env, meter_id);
         meter.user.require_auth();
 
-        let bond_amount = env.storage().instance().get::<_, i128>(&DataKey::DisputeBondAmount).unwrap_or(0);
-        
-        // Transfer bond from user to contract
-        let token_client = token::Client::new(&env, &meter.token);
-        token_client.transfer(&meter.user, &env.current_contract_address(), &bond_amount);
-
-        // Disputed amount is "locked" in the contract. 
-        // For simplicity, we'll just track it in a Dispute struct.
-        // The funds are already in the contract (from top-up or earned by provider but not yet withdrawn).
-        
-        let mut dispute_count = env.storage().instance().get::<_, u64>(&DataKey::DisputeCount).unwrap_or(0);
-        dispute_count += 1;
-
-        let dispute = Dispute {
-            meter_id,
-            amount,
-            bond: bond_amount,
-            status: DisputeStatus::Open,
-            raised_at: env.ledger().timestamp(),
-        };
-
-        env.storage().instance().set(&DataKey::Dispute(dispute_count), &dispute);
-        env.storage().instance().set(&DataKey::DisputeCount, &dispute_count);
-
-        env.events().publish((symbol_short!("Dispute"), meter_id), dispute_count);
-        
-        dispute_count
-    }
-
-    pub fn resolve_in_favor_of_payer(env: Env, auditor: Address, dispute_id: u64) {
-        require_role(&env, &auditor, Role::Auditor);
-        auditor.require_auth();
-
-        let mut dispute = env.storage().instance().get::<_, Dispute>(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
-
-        if dispute.status != DisputeStatus::Open {
-            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
-        }
-
-        let meter = get_meter_or_panic(&env, dispute.meter_id);
-        let token_client = token::Client::new(&env, &meter.token);
-
-        // Return bond and disputed amount to payer
-        let total_return = dispute.amount.saturating_add(dispute.bond);
-        token_client.transfer(&env.current_contract_address(), &meter.user, &total_return);
-
-        dispute.status = DisputeStatus::ResolvedInFavorOfPayer;
-        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
-
-        env.events().publish((symbol_short!("ResPayer"), dispute_id), total_return);
-    }
-
-    pub fn resolve_in_favor_of_provider(env: Env, auditor: Address, dispute_id: u64) {
-        require_role(&env, &auditor, Role::Auditor);
-        auditor.require_auth();
-
-        let mut dispute = env.storage().instance().get::<_, Dispute>(&DataKey::Dispute(dispute_id))
-            .unwrap_or_else(|| panic_with_error!(&env, ContractError::DisputeNotFound));
-
-        if dispute.status != DisputeStatus::Open {
-            panic_with_error!(&env, ContractError::DisputeAlreadyResolved);
-        }
-
-        let meter = get_meter_or_panic(&env, dispute.meter_id);
-        let token_client = token::Client::new(&env, &meter.token);
-
-        // Disputed amount stays with contract (provider can withdraw later) or transfer to provider now?
-        // Usually, if resolved in favor of provider, they get the funds.
-        token_client.transfer(&env.current_contract_address(), &meter.provider, &dispute.amount);
-        
-        // Bond could be returned to payer or kept as penalty? 
-        // Requirement doesn't specify. I'll return the bond to the payer to be fair if it's just a spam prevention.
-        // Actually, usually bonds are forfeited if the dispute is malicious. 
-        // I'll return it for now, or transfer to maintenance.
-        token_client.transfer(&env.current_contract_address(), &meter.user, &dispute.bond);
-
-        dispute.status = DisputeStatus::ResolvedInFavorOfProvider;
-        env.storage().instance().set(&DataKey::Dispute(dispute_id), &dispute);
-
-        env.events().publish((symbol_short!("ResProv"), dispute_id), dispute.amount);
-    }
-
-    pub fn withdraw_earnings_path_payment(env: Env, meter_id: u64, amount_usd_cents: i128, destination_token: Address) {
-        lock_reentrancy(&env);
-        let mut meter = get_meter_or_panic(&env, meter_id);
-        meter.provider.require_auth();
+    /// Create a new continuous flow stream with mandatory buffer deposit
+    /// Buffer must equal at least 24 hours of the negotiated flow rate
+    pub fn create_continuous_stream(
+        env: Env,
+        stream_id: u64,
+        flow_rate_per_second: i128,
+        initial_balance: i128,
+        provider: Address,
+        payer: Address,
+    ) {
+        provider.require_auth(); // Provider must authorize stream creation
+        payer.require_auth(); // Payer must authorize buffer deposit
         
         if flow_rate_per_second < 0 || initial_balance < 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
@@ -5385,7 +5202,6 @@ env.storage()
             (symbol_short!("ZKUsage"), meter_id),
             (units_consumed, cost),
         );
-        unlock_reentrancy(&env);
     }
 
     /// Get the required buffer amount for a given flow rate
