@@ -110,7 +110,7 @@ impl GrantStreamListener {
 
         // Check monthly grant limit
         let year_month = Self::get_year_month(env.ledger().timestamp());
-        let monthly_limit_key = GrantDataKey::MonthlyGrantLimit(year_month, goal_event.goal_id);
+        let monthly_limit_key = GrantDataKey::MonthlyGrantLimit(year_month, goal_event.goal_id as u32);
         let current_monthly_grants = env.storage()
             .instance()
             .get::<_, i128>(&monthly_limit_key)
@@ -229,7 +229,7 @@ impl GrantStreamListener {
         env.storage().instance().set(&GrantDataKey::GrantConfig, &config);
 
         env.events().publish(
-            (symbol_short!("GrantCfgUp"),),
+            (symbol_short!("GrntCfgUp"),),
             (enabled, max_grant_per_month),
         );
     }
