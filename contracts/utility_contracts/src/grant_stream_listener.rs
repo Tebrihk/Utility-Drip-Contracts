@@ -159,7 +159,7 @@ impl GrantStreamListener {
         env.storage().instance().set(&monthly_limit_key, &(current_monthly_grants + goal_event.grant_amount));
 
         // Update total granted
-        let mut updated_config = config;
+        let mut updated_config = config.clone();
         updated_config.total_granted += goal_event.grant_amount;
         env.storage().instance().set(&GrantDataKey::GrantConfig, &updated_config);
 

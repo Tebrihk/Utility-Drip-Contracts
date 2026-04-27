@@ -2,7 +2,7 @@
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, symbol_short, token,
-    Address, Bytes, Env, BytesN, Vec, Symbol, String,
+    Address, Bytes, BytesN, Env, String, Symbol, Vec,
 };
 
 // Oracle client interface
@@ -54,7 +54,7 @@ pub enum StreamStatus {
     Depleted = 2,
 }
 
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ContinuousFlow {
     // Tightly packed struct for optimal storage
@@ -69,6 +69,12 @@ pub struct ContinuousFlow {
     pub buffer_balance: i128,     // 16 bytes - pre-paid buffer balance (24 hours of flow)
     pub buffer_warning_sent: bool, // 1 byte - whether buffer warning has been sent
     pub payer: Address,           // 32 bytes - payer address for buffer refunds
+    /// Issue #251 — `enterprise::PriorityTier` discriminant stored as `u32`.
+    pub priority_tier: u32,
+    pub grid_epoch_seen: u64,
+    /// Ed25519 public key mapped from device MAC identity; zero means heartbeat not enforced on-chain.
+    pub device_mac_pubkey: BytesN<32>,
+    pub is_unreliable: bool,
 }
 // Minimum balance required to keep the IoT relay open (500 tokens for testing)
 const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
@@ -77,7 +83,7 @@ const MINIMUM_BALANCE_TO_FLOW: i128 = 500; // 500 tokens minimum for testing
 const BUFFER_DURATION_SECONDS: u64 = 24 * HOUR_IN_SECONDS; // 24 hours
 const BUFFER_WARNING_THRESHOLD: i128 = 3600; // Warning when 1 hour of buffer left
 
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub struct UsageData {
     pub total_watt_hours: i128,
@@ -119,6 +125,7 @@ use gas_estimator::GasCostEstimator;
 
 pub mod grant_stream_listener;
 pub mod velocity_limit;
+pub mod enterprise;
 use velocity_limit::{check_velocity_limits, apply_override, revoke_override, get_velocity_config, set_velocity_config, VelocityDataKey};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -129,7 +136,7 @@ pub struct SavingGoal {
     pub is_completed: bool,
 }
 
-#[contracttype]
+#[contracttype(export = false)]
 #[derive(Clone)]
 pub struct Meter {
     pub user: Address,
@@ -626,38 +633,97 @@ pub struct TreasuryReconciliationEvent {
     pub timestamp: u64,
 }
 
-#[contracttype]
-pub enum DataKey {
-    Meter(u64),
-    Count,
-    Oracle,
-    GasBuffer(Address),
-    ActiveMetersCount,
-    SeasonalFactor,
-    Treasury,
-    ProviderVolume(Address),
-    SavingGoal(u64),
-    NativeToken,
-    TaxRateBps,
-    ProtocolFeeBps,
-    SupportedToken(Address),
-    SupportedWithdrawalToken(Address),
-    ProviderTotalPool(Address),
-    ContinuousFlow(u64),
-    DustAggregation(Address),
-    AdminAddress,
-    GasBountyPool,
-    BufferVault(u64), // Per-stream buffer vault tracking
-    // Issue #197: Streaming-Fee Collector
-    PlatformFeeBps,
-    ProtocolFeeVault,
-    StreamingFeeAccrued(u64), // Per-stream accrued fees
-    // Issue #195: Minimum Yield-Routing Gas Thresholds
-    MinRouteThreshold,
+#[contracttype(export = false)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SlaReportKey {
+    pub meter_id: u64,
+    pub start_time: u64,
+    pub end_time: u64,
 }
 
-#[contracterror]
-#[derive(Copy, Clone, Eq, PartialEq)]
+#[contracttype(export = false)]
+pub enum DataKey {
+    ActiveMetersCount,
+    ActiveUsers,
+    AdminAddress,
+    AdminTransferProposal,
+    AdminVeto(Address, u64),
+    AuthorizedContributor(u64, Address),
+    AutoExtendThreshold,
+    BillingGroup(Address),
+    BufferVault(u64),
+    ComplianceOfficer,
+    ConservationGoal(u64),
+    ContinuousFlow(u64),
+    Contributor(u64, Address),
+    Count,
+    CurrentAdmin,
+    DaoGovernor,
+    DeviceHash(BytesN<32>),
+    DustAggregation(Address),
+    FleetAgg(Address),
+    FleetCap(Address),
+    GasBountyPool,
+    GasBuffer(Address),
+    GovernmentVault,
+    GrantStreamMatch(u64, Address),
+    GridAdministrator,
+    ImpactSBTMinted(u64),
+    LastAlert(u64),
+    LegalFreeze(u64),
+    LegalVault,
+    MaintenanceFund(u64),
+    MaintenanceWallet,
+    Meter(u64),
+    MeterDevice(u64),
+    MinRouteThreshold,
+    MultiSigConfig(Address),
+    NativeToken,
+    NullifierMap(BytesN<32>),
+    Oracle,
+    PairingChallenge(u64),
+    PendingDeviceTransfer(BytesN<32>, Address),
+    P2PCreditVault(Address),
+    PlatformFeeBps,
+    PollVotes(Symbol),
+    PrivateBillingStatus(u64),
+    ProposedUpgrade,
+    ProtocolFeeBps,
+    ProtocolFeeVault,
+    ProviderGridEpoch(Address),
+    ProviderTotalPool(Address),
+    ProviderVolume(Address),
+    ProviderWindow(Address),
+    Referral(Address),
+    ResellerConfig(u64),
+    SavingGoal(u64),
+    SeasonalFactor,
+    SLANode(BytesN<32>),
+    SLAReportCount(SlaReportKey),
+    SLAReportNode(SlaReportKey, BytesN<32>),
+    StreamLastHeartbeat(u64),
+    StreamingFeeAccrued(u64),
+    SubDaoConfig(Address),
+    SupportedToken(Address),
+    SupportedWithdrawalToken(Address),
+    TaxRateBps,
+    Treasury,
+    UpgradeProposalTime,
+    UserVetoed(Address, u64),
+    UserVoted(Address, Symbol),
+    VerifiedProvider(Address),
+    VetoCount,
+    VetoDeadline,
+    WebhookConfig(Address),
+    WithdrawalApproval(Address, u64, Address),
+    WithdrawalRequest(Address, u64),
+    WithdrawalRequestCount(Address),
+    ZKEnabledMeters,
+    ZKVerificationKey(u64),
+}
+
+#[contracterror(export = false)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ContractError {
     MeterNotFound = 1,
@@ -685,6 +751,57 @@ pub enum ContractError {
     BelowMinRouteThreshold = 22,
     // Issue #197
     ProtocolFeeVaultNotSet = 23,
+    // --- extended (github issues & features) ---
+    FleetCapExceeded = 24,
+    SelfP2PNotAllowed = 25,
+    AdminExecutionWindowExpired = 26,
+    AdminTransferActive = 27,
+    AlreadyApprovedWithdrawal = 28,
+    AlreadyVoted = 29,
+    AmountBelowMultiSigThreshold = 30,
+    ChallengeActive = 31,
+    ComplianceCouncilApprovalRequired = 32,
+    ConservationGoalNotFound = 33,
+    DeviceAlreadyBoundToAnotherMeter = 34,
+    FirmwareUpdateInProgress = 35,
+    FirmwareUpdateWindowExpired = 36,
+    GoalAlreadyAchieved = 37,
+    GoalExpired = 38,
+    ImpactNotSignificantEnough = 39,
+    InDispute = 40,
+    InsufficientApprovals = 41,
+    InvalidFinanceWalletCount = 42,
+    InvalidFirmwareUpdateSignature = 43,
+    InvalidGrantAmount = 44,
+    InvalidResellerFee = 45,
+    InvalidSignatureThreshold = 46,
+    InvalidWasmHash = 47,
+    LegalFreezeAlreadyActive = 48,
+    LowPriorityStreamPaused = 49,
+    MaintenanceFundInsufficient = 50,
+    MeterNotFrozen = 51,
+    MultiSigAlreadyConfigured = 52,
+    MultiSigNotConfigured = 53,
+    NoAdminTransferInProgress = 54,
+    NodeNotTrusted = 55,
+    NotApprovedByWallet = 56,
+    NotAuthorizedFinanceWallet = 57,
+    NotParentDao = 58,
+    PriceConversionFailed = 59,
+    PrivacyNotEnabled = 60,
+    SBTAlreadyMinted = 61,
+    UpgradeProposalActive = 62,
+    VerificationAlreadyGranted = 63,
+    VelocityLimitBreach = 64,
+    VetoPeriodExpired = 65,
+    VetoThresholdNotReached = 66,
+    WithdrawalAlreadyCancelled = 67,
+    WithdrawalAlreadyExecuted = 68,
+    WithdrawalRequestExpired = 69,
+    WithdrawalRequestNotFound = 70,
+    SubDaoNotConfigured = 71,
+    SubDaoBudgetExceeded = 72,
+    UnauthorizedContributor = 73,
 }
 
 #[contracttype]
@@ -718,6 +835,22 @@ const DEFAULT_MIN_ROUTE_THRESHOLD: i128 = 10_000_000;
 // Issue #197: Streaming-Fee Collector
 // Max platform fee: 1000 bps = 10%
 const MAX_PLATFORM_FEE_BPS: i128 = 1000;
+
+// --- shared protocol constants (referenced across claim / upgrade / multi-sig) ---
+const THROTTLING_THRESHOLD_PERCENT: i128 = 20;
+const HEARTBEAT_THRESHOLD_SECONDS: u64 = 3600;
+const DEFAULT_TAX_RATE_BPS: i128 = 50;
+const MAINTENANCE_FUND_PERCENT_BPS: i128 = 100;
+const AUTO_EXTEND_LEDGER_THRESHOLD: u32 = 100;
+const LEDGER_LIFETIME_EXTENSION: u32 = 10_000;
+const UPGRADE_VETO_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS;
+const VETO_THRESHOLD_BPS: i128 = 500;
+const MAX_RESELLER_FEE_BPS: i128 = 500;
+const REFERRAL_REWARD_UNITS: i128 = 10;
+const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * HOUR_IN_SECONDS;
+const MIN_FINANCE_WALLETS: u32 = 3;
+const MAX_FINANCE_WALLETS: u32 = 5;
+const WITHDRAWAL_REQUEST_EXPIRY: u64 = 7 * DAY_IN_SECONDS;
 
 fn get_meter_or_panic(env: &Env, meter_id: u64) -> Meter {
     match env
@@ -1308,6 +1441,7 @@ fn store_nullifier(env: &Env, nullifier: BytesN<32>) {
 
 /// Create a new continuous flow stream with timestamp-based tracking and buffer vault
 fn create_continuous_flow(
+    env: &Env,
     stream_id: u64,
     flow_rate_per_second: i128,
     initial_balance: i128,
@@ -1315,6 +1449,9 @@ fn create_continuous_flow(
     current_timestamp: u64,
     provider: Address,
     payer: Address,
+    priority_tier: u32,
+    grid_epoch_seen: u64,
+    device_mac_pubkey: BytesN<32>,
 ) -> ContinuousFlow {
     ContinuousFlow {
         stream_id,
@@ -1323,11 +1460,15 @@ fn create_continuous_flow(
         last_flow_timestamp: current_timestamp,
         created_timestamp: current_timestamp,
         status: if initial_balance > 0 { StreamStatus::Active } else { StreamStatus::Paused },
-        paused_at: 0, // Not paused initially
+        paused_at: 0,
         provider,
         buffer_balance: buffer_amount,
         buffer_warning_sent: false,
         payer,
+        priority_tier,
+        grid_epoch_seen,
+        device_mac_pubkey,
+        is_unreliable: false,
     }
 }
 
@@ -1418,14 +1559,22 @@ fn update_continuous_flow(
             
             flow.accumulated_balance = 0;
             flow.buffer_balance = 0;
+            let rate = flow.flow_rate_per_second;
+            flow.flow_rate_per_second = 0;
             flow.status = StreamStatus::Depleted;
             flow.last_flow_timestamp = current_timestamp;
+
+            crate::enterprise::fleet_apply_delta(env, &flow.provider, -rate);
             
             // Emit BufferDepleted event
             env.events().publish(
                 (symbol_short!("BufDeplet"),),
                 (flow.stream_id, current_timestamp, actual_buffer_deduction, flow.provider.clone())
             );
+
+            env.storage()
+                .instance()
+                .set(&DataKey::ContinuousFlow(flow.stream_id), &flow);
             
             return Ok(total_deduction);
         }
@@ -1450,8 +1599,11 @@ fn update_continuous_flow(
     flow.last_flow_timestamp = current_timestamp;
     
     // Update status based on remaining balances
-    if flow.accumulated_balance == 0 && flow.buffer_balance == 0 {
+    if flow.accumulated_balance == 0 && flow.buffer_balance == 0 && flow.status != StreamStatus::Depleted {
+        let rate = flow.flow_rate_per_second;
+        flow.flow_rate_per_second = 0;
         flow.status = StreamStatus::Depleted;
+        crate::enterprise::fleet_apply_delta(env, &flow.provider, -rate);
     } else if flow.status == StreamStatus::Paused && (flow.accumulated_balance > 0 || flow.buffer_balance > 0) {
         flow.status = StreamStatus::Active;
     }
@@ -1478,6 +1630,8 @@ fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), Con
     
     // Update flow calculation up to pause moment
     update_continuous_flow(env, &mut flow, current_timestamp)?;
+
+    let rate_before = flow.flow_rate_per_second;
     
     // Set paused status and record timestamp
     flow.status = StreamStatus::Paused;
@@ -1488,6 +1642,8 @@ fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), Con
     env.storage()
         .instance()
         .set(&DataKey::ContinuousFlow(stream_id), &flow);
+
+    crate::enterprise::fleet_apply_delta(env, &flow.provider, -rate_before);
     
     // Emit StreamPaused event
     env.events().publish(
@@ -1533,6 +1689,7 @@ fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Addr
     
     // Resume the stream with new flow rate
     flow.status = StreamStatus::Active;
+    crate::enterprise::fleet_assert_room_for_new_stream(env, &flow.provider, new_flow_rate);
     flow.flow_rate_per_second = new_flow_rate;
     flow.last_flow_timestamp = current_timestamp; // Reset flow timestamp
     flow.paused_at = 0; // Clear pause timestamp
@@ -1541,10 +1698,12 @@ fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Addr
     env.storage()
         .instance()
         .set(&DataKey::ContinuousFlow(stream_id), &flow);
+
+    crate::enterprise::fleet_apply_delta(env, &flow.provider, new_flow_rate);
     
     // Emit StreamResumed event
     env.events().publish(
-        symbol_short!("StreamResumed"),
+        symbol_short!("StrmResum"),
         (stream_id, current_timestamp, provider.clone(), new_flow_rate, pause_duration)
     );
     
@@ -1577,20 +1736,18 @@ fn update_flow_rate(
     // Update timestamp to current time
     let current_timestamp = env.ledger().timestamp();
     
-    // Emit detailed StreamUpdated event
-    let event = StreamUpdatedEvent {
-        stream_id,
-        old_flow_rate,
-        new_flow_rate,
-        timestamp: current_timestamp,
-        old_status,
-        new_status: flow.status,
-    };
-    
     env.events().publish(
         (symbol_short!("StrmUpd"),),
         (stream_id, old_flow_rate, new_flow_rate, current_timestamp, old_status as u32, flow.status as u32)
     );
+
+    let delta = new_flow_rate.saturating_sub(old_flow_rate);
+    if delta != 0 && old_status != StreamStatus::Depleted && flow.status != StreamStatus::Depleted {
+        if delta > 0 {
+            crate::enterprise::fleet_assert_room_for_new_stream(env, &flow.provider, delta);
+        }
+        crate::enterprise::fleet_apply_delta(env, &flow.provider, delta);
+    }
     
     // Store updated flow
     env.storage()
@@ -1601,7 +1758,7 @@ fn update_flow_rate(
 }
 
 /// Get continuous flow or panic if not found
-fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
+pub(crate) fn get_continuous_flow_or_panic(env: &Env, stream_id: u64) -> ContinuousFlow {
     match env
         .storage()
         .instance()
@@ -2208,14 +2365,14 @@ impl UtilityContract {
     /// Register a trusted monitoring node (Admin only)
     pub fn add_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
-        env.storage().instance().set(&DataKey::SLANode(node_pk), &true);
+        env.storage().instance().set(&DataKey::SLANode(node_pk.clone()), &true);
         env.events().publish((symbol_short!("SLANode"),), (node_pk, true));
     }
 
     /// Remove a trusted monitoring node (Admin only)
     pub fn remove_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
-        env.storage().instance().set(&DataKey::SLANode(node_pk), &false);
+        env.storage().instance().set(&DataKey::SLANode(node_pk.clone()), &false);
         env.events().publish((symbol_short!("SLANode"),), (node_pk, false));
     }
 
@@ -2239,8 +2396,8 @@ impl UtilityContract {
         }
 
         // 2. Verify signature
-        // We use the raw report data for signature verification
-        let report_xdr = signed_report.report.to_xdr(&env);
+        let report = signed_report.report.clone();
+        let report_xdr = report.to_xdr(&env);
         env.crypto().ed25519_verify(
             &signed_report.node_public_key,
             &report_xdr,
@@ -2248,7 +2405,11 @@ impl UtilityContract {
         );
 
         // 3. Process the report with consensus logic
-        let report_key = (signed_report.report.meter_id, signed_report.report.start_time, signed_report.report.end_time);
+        let report_key = SlaReportKey {
+            meter_id: report.meter_id,
+            start_time: report.start_time,
+            end_time: report.end_time,
+        };
         
         // Prevent duplicate reporting by the same node for the same interval
         let node_key = DataKey::SLAReportNode(report_key.clone(), signed_report.node_public_key.clone());
@@ -2266,16 +2427,16 @@ impl UtilityContract {
         // Threshold for consensus: 2 nodes (in a real system this might be dynamic or higher)
         // This addresses "Test the logic with multiple conflicting monitoring node reports"
         if new_count == 2 {
-            let mut meter = get_meter_or_panic(&env, signed_report.report.meter_id);
-            let downtime = signed_report.report.end_time.saturating_sub(signed_report.report.start_time);
+            let mut meter = get_meter_or_panic(&env, report.meter_id);
+            let downtime = report.end_time.saturating_sub(report.start_time);
             
             if downtime > 0 {
                 meter.sla_state.accumulated_downtime = meter.sla_state.accumulated_downtime.saturating_add(downtime);
                 meter.sla_state.last_report_timestamp = env.ledger().timestamp();
-                env.storage().instance().set(&DataKey::Meter(signed_report.report.meter_id), &meter);
+                env.storage().instance().set(&DataKey::Meter(report.meter_id), &meter);
                 
                 env.events().publish(
-                    (Symbol::new(&env, "SLADowntimeReported"), signed_report.report.meter_id),
+                    (Symbol::new(&env, "SLADowntimeReported"), report.meter_id),
                     (downtime, meter.sla_state.accumulated_downtime)
                 );
             }
@@ -4682,7 +4843,7 @@ env.storage()
         // Update spent budget (simplified)
         let mut updated_config = config;
         updated_config.spent_budget += off_peak_rate; // Simplified accounting
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &updated_config);
+        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao.clone()), &updated_config);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("SubDaoStr"), meter_id),
@@ -4710,7 +4871,7 @@ env.storage()
         // Reduce allocated budget
         config.allocated_budget = config.allocated_budget.saturating_sub(amount);
 
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &config);
+        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events().publish(
             (symbol_short!("SubDaoR"),),
@@ -4734,11 +4895,11 @@ env.storage()
         }
 
         config.is_active = false;
-        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao), &config);
+        env.storage().instance().set(&DataKey::SubDaoConfig(sub_dao.clone()), &config);
 
         env.events().publish(
             (soroban_sdk::symbol_short!("SubDaoOff"),),
-            sub_dao,
+            sub_dao.clone(),
         );
     }
 
@@ -5317,7 +5478,7 @@ env.storage()
             .set(&DataKey::PrivateBillingStatus(meter_id), &privacy_status);
 
         env.events()
-            .publish((symbol_short!("PrivacyOff"), meter_id), meter.user.clone());
+            .publish((symbol_short!("PrivOff"), meter_id), meter.user.clone());
     }
 
     /// Create a new continuous flow stream with mandatory buffer deposit
@@ -5329,6 +5490,8 @@ env.storage()
         initial_balance: i128,
         provider: Address,
         payer: Address,
+        priority_tier: u32,
+        device_mac_pubkey: BytesN<32>,
     ) {
         provider.require_auth(); // Provider must authorize stream creation
         payer.require_auth(); // Payer must authorize buffer deposit
@@ -5337,14 +5500,32 @@ env.storage()
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
 
+        crate::enterprise::fleet_assert_room_for_new_stream(&env, &provider, flow_rate_per_second);
+
         let current_timestamp = env.ledger().timestamp();
-        let mut flow = create_continuous_flow(stream_id, flow_rate_per_second, initial_balance, current_timestamp);
-        flow.provider = provider.clone();
-        flow.payer = payer.clone();
+        let buffer_amount = calculate_required_buffer(flow_rate_per_second);
+        let grid_st = crate::enterprise::provider_grid_state(&env, &provider);
+        let flow = create_continuous_flow(
+            &env,
+            stream_id,
+            flow_rate_per_second,
+            initial_balance,
+            buffer_amount,
+            current_timestamp,
+            provider.clone(),
+            payer.clone(),
+            priority_tier,
+            grid_st.epoch,
+            device_mac_pubkey,
+        );
 
         env.storage()
             .instance()
             .set(&DataKey::ContinuousFlow(stream_id), &flow);
+
+        if flow.status == StreamStatus::Active && flow.flow_rate_per_second > 0 {
+            crate::enterprise::fleet_apply_delta(&env, &provider, flow.flow_rate_per_second);
+        }
 
         env.events().publish(
             symbol_short!("StreamNew"),
@@ -5416,6 +5597,14 @@ env.storage()
 
         let current_timestamp = env.ledger().timestamp();
         update_continuous_flow(&env, &mut flow, current_timestamp).unwrap();
+        if flow.status == StreamStatus::Active && flow.flow_rate_per_second > 0 {
+            let r = flow.flow_rate_per_second;
+            crate::enterprise::fleet_apply_delta(&env, &flow.provider, -r);
+            flow.flow_rate_per_second = 0;
+            env.storage()
+                .instance()
+                .set(&DataKey::ContinuousFlow(stream_id), &flow);
+        }
         
         // Refund buffer
         let refunded_amount = refund_buffer(&env, stream_id).unwrap();
@@ -5428,7 +5617,7 @@ env.storage()
         let withdrawn = withdraw_from_flow(&env, stream_id, withdrawal_amount).unwrap();
         
         env.events().publish(
-            symbol_short!("Withdrawal"),
+            symbol_short!("Withdraw"),
             (stream_id, withdrawn)
         );
         
@@ -5468,8 +5657,7 @@ env.storage()
             })
     }
 
-    pub fn sweep_dust(env: Env, token_address: Address, max_streams: Option<u64>) -> DustCollectedEvent {
-        let caller = env.invoker();
+    pub fn sweep_dust(env: Env, caller: Address, token_address: Address, max_streams: Option<u64>) -> DustCollectedEvent {
         let is_admin = match env.storage().instance().get::<DataKey, Address>(&DataKey::AdminAddress) {
             Some(admin) => admin == caller,
             None => false,
@@ -5711,7 +5899,7 @@ env.storage()
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         env.storage().instance().set(&DataKey::PlatformFeeBps, &fee_bps);
-        env.events().publish(symbol_short!("FeeSet"), fee_bps);
+        env.events().publish((symbol_short!("FeeSet"),), fee_bps);
     }
 
     /// Set the Protocol Fee Vault address (admin only).
@@ -5720,7 +5908,7 @@ env.storage()
         let admin = get_admin_or_panic(&env);
         admin.require_auth();
         env.storage().instance().set(&DataKey::ProtocolFeeVault, &vault);
-        env.events().publish(symbol_short!("VaultSet"), vault);
+        env.events().publish((symbol_short!("VaultSet"),), vault);
     }
 
     /// Sweep accrued streaming fees for a stream to the Protocol Fee Vault.
@@ -5784,7 +5972,7 @@ env.storage()
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         env.storage().instance().set(&DataKey::MinRouteThreshold, &threshold);
-        env.events().publish(symbol_short!("ThreshSet"), threshold);
+        env.events().publish((symbol_short!("ThreshSet"),), threshold);
     }
 
     /// Get the current minimum yield-routing threshold.
@@ -5811,9 +5999,90 @@ env.storage()
 
         // Routing logic placeholder — actual AMM/yield integration is protocol-specific.
         // Emits an event so off-chain indexers can track routed capital.
-        env.events().publish(symbol_short!("Routed"), (amount, threshold));
+        env.events().publish((symbol_short!("Routed"),), (amount, threshold));
 
         amount
+    }
+
+    // --- Issues #248–#251 (enterprise) thin entrypoints ---
+    pub fn set_provider_fleet_cap(env: Env, provider: Address, new_cap: i128, authority: Address) {
+        crate::enterprise::set_fleet_cap_super_admin(&env, provider, new_cap, authority);
+    }
+
+    pub fn set_dao_governor(env: Env, dao: Address) {
+        let super_a = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::CurrentAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedAdmin));
+        super_a.require_auth();
+        env.storage().instance().set(&DataKey::DaoGovernor, &dao);
+    }
+
+    pub fn set_grid_administrator(env: Env, grid_admin: Address) {
+        let super_a = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::CurrentAdmin)
+            .unwrap_or_else(|| panic_with_error!(&env, ContractError::UnauthorizedAdmin));
+        super_a.require_auth();
+        env.storage().instance().set(&DataKey::GridAdministrator, &grid_admin);
+    }
+
+    pub fn grid_shortage_load_shed(env: Env, provider: Address, min_surviving_tier: u32, grid_admin: Address) {
+        use crate::enterprise::PriorityTier;
+        let tier = match min_surviving_tier {
+            3 => PriorityTier::Critical,
+            2 => PriorityTier::High,
+            1 => PriorityTier::Standard,
+            _ => PriorityTier::Low,
+        };
+        crate::enterprise::global_load_shed(&env, provider, tier, grid_admin);
+    }
+
+    pub fn stream_device_heartbeat(
+        env: Env,
+        stream_id: u64,
+        meter_id: u64,
+        signature: BytesN<64>,
+        pub_key: BytesN<32>,
+    ) {
+        crate::enterprise::stream_heartbeat(&env, stream_id, meter_id, signature, pub_key);
+    }
+
+    pub fn pardon_stream_liveness(env: Env, stream_id: u64) {
+        let flow = get_continuous_flow_or_panic(&env, stream_id);
+        crate::enterprise::pardon_liveness_slash(&env, stream_id, flow.provider);
+    }
+
+    pub fn apply_liveness_slash(env: Env, stream_id: u64, meter_id: u64, stale_threshold_ledgers: u32) -> i128 {
+        crate::enterprise::liveness_check_and_slash(&env, stream_id, meter_id, stale_threshold_ledgers)
+    }
+
+    pub fn p2p_finalize_exchange(
+        env: Env,
+        supplier: Address,
+        consumer: Address,
+        utility_treasury: Address,
+        supply_rate: i128,
+        demand_rate: i128,
+        delta_seconds: i128,
+        grid_fee_bps: i128,
+        battery_credit_cap: i128,
+        token: Address,
+    ) -> (i128, i128) {
+        crate::enterprise::p2p_finalize_exchange(
+            &env,
+            supplier,
+            consumer,
+            utility_treasury,
+            supply_rate,
+            demand_rate,
+            delta_seconds,
+            grid_fee_bps,
+            battery_credit_cap,
+            &token,
+        )
     }
 }
 
