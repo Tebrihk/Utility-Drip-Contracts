@@ -455,7 +455,7 @@ pub fn apply_override(
     
     let override_config = VelocityOverride {
         override_scope: scope,
-        admin,
+        admin: admin.clone(),
         created_at: now,
         expires_at,
         reason: reason.clone(),
