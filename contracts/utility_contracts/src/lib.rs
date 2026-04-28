@@ -204,6 +204,12 @@ mod buffer_tests;
 mod stroop_fuzz_tests;
 #[cfg(test)]
 mod streaming_invariant_tests;
+#[cfg(test)]
+mod nonce_sync_tests;
+#[cfg(test)]
+mod tariff_oracle_tests;
+#[cfg(test)]
+mod ghost_sweeper_tests;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -292,6 +298,9 @@ use gas_estimator::GasCostEstimator;
 pub mod grant_stream_listener;
 pub mod velocity_limit;
 pub mod enterprise;
+pub mod nonce_sync;
+pub mod tariff_oracle;
+pub mod ghost_sweeper;
 use velocity_limit::{check_velocity_limits, apply_override, revoke_override, get_velocity_config, set_velocity_config, VelocityDataKey};
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -905,6 +914,20 @@ pub enum DataKey {
     ClawbackNonce(Address),
     // Issue #255
     GuarantorDeposit(Address),
+    // Issue #260 - Nonce Sync
+    DeviceNonce(BytesN<32>),
+    NonceResetRequest(u64),
+    AuthorizedNonceResetters,
+    // Issue #261 - Tariff Oracle
+    TariffOracleAdmin,
+    CurrentTariffSchedule,
+    TariffScheduleHash,
+    TariffUpdateProposal(u64),
+    TariffProposalCounter,
+    TodayTariffSchedule,
+    // Issue #262 - Ghost Sweeper
+    StreamArchive(u64),
+    SweeperStatistics,
 }
 
 #[contracterror(export = false)]
@@ -995,6 +1018,20 @@ pub enum ContractError {
     ClawbackBalanceMismatch = 77,
     // Issue #259 — Reputation
     ReputationQueryFailed = 78,
+    // Issue #260 — Nonce Sync
+    NonceDesyncDetected = 79,
+    NonceResetUnauthorized = 80,
+    DeviceMarkedSuspicious = 81,
+    NonceWindowExceeded = 82,
+    // Issue #261 — Tariff Oracle
+    InvalidTariffSchedule = 83,
+    TariffUpdateNotReady = 84,
+    TariffOracleNotConfigured = 85,
+    InvalidTariffHour = 86,
+    // Issue #262 — Ghost Sweeper
+    StreamNotEligibleForPruning = 87,
+    StreamHasPendingBuffer = 88,
+    ArchiveCorrupted = 89,
 }
 
 #[contracttype]
