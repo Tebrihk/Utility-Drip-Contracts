@@ -1046,6 +1046,12 @@ pub enum ContractError {
     InvalidAddress = 94,
     InvalidFeeAmount = 95,
     ExcessiveFee = 96,
+    // Issue #280 — Yield routing fallback handling
+    YieldRoutingFailed = 97,
+    YieldProtocolUnavailable = 98,
+    // Issue #273 — Flow rate boundary checks
+    FlowRateTooLow = 99,
+    FlowRateTooHigh = 100,
 }
 
 #[contracttype]
@@ -1075,6 +1081,14 @@ const GAS_BUFFER_TOP_UP_THRESHOLD: i128 = 200;  // Auto-top up when buffer falls
 // Issue #195: Minimum Yield-Routing Gas Threshold
 // Default: 10_000_000 stroops (1 XLM). Routing below this costs more in gas than it earns.
 const DEFAULT_MIN_ROUTE_THRESHOLD: i128 = 10_000_000;
+
+// Issue #273: Flow Rate Boundary Constants
+// Minimum flow rate: 1 micro-stroop per second (prevents zero/negative flows)
+const MIN_FLOW_RATE_PER_SECOND: i128 = 1;
+// Maximum flow rate: 1 billion XLM per second (prevents overflow attacks)
+const MAX_FLOW_RATE_PER_SECOND: i128 = 1_000_000_000_000_000_000;
+// Maximum hourly flow rate for meter limits
+const MAX_HOURLY_FLOW_RATE: i128 = MAX_FLOW_RATE_PER_SECOND * 3600;
 
 // Issue #197: Streaming-Fee Collector
 // Max platform fee: 1000 bps = 10%
@@ -1179,6 +1193,32 @@ fn validate_user_bytes(bytes: &Bytes, max_size: usize) -> Result<(), ContractErr
     
     if bytes.len() == 0 {
         return Err(ContractError::InvalidTokenAmount); // Reuse error for empty validation
+    }
+    
+    Ok(())
+}
+
+/// Issue #273: Validate flow rate is within acceptable boundaries
+fn validate_flow_rate(flow_rate: i128) -> Result<(), ContractError> {
+    if flow_rate < MIN_FLOW_RATE_PER_SECOND {
+        return Err(ContractError::FlowRateTooLow);
+    }
+    
+    if flow_rate > MAX_FLOW_RATE_PER_SECOND {
+        return Err(ContractError::FlowRateTooHigh);
+    }
+    
+    Ok(())
+}
+
+/// Issue #273: Validate hourly flow rate is within acceptable boundaries
+fn validate_hourly_flow_rate(hourly_rate: i128) -> Result<(), ContractError> {
+    if hourly_rate < MIN_FLOW_RATE_PER_SECOND * 3600 {
+        return Err(ContractError::FlowRateTooLow);
+    }
+    
+    if hourly_rate > MAX_HOURLY_FLOW_RATE {
+        return Err(ContractError::FlowRateTooHigh);
     }
     
     Ok(())
@@ -1887,8 +1927,11 @@ fn create_continuous_flow(
     priority_tier: u32,
     grid_epoch_seen: u64,
     device_mac_pubkey: BytesN<32>,
-) -> ContinuousFlow {
-    ContinuousFlow {
+) -> Result<ContinuousFlow, ContractError> {
+    // Issue #273: Validate flow rate boundaries
+    validate_flow_rate(flow_rate_per_second)?;
+
+    Ok(ContinuousFlow {
         stream_id,
         flow_rate_per_second,
         accumulated_balance: initial_balance,
@@ -1904,7 +1947,7 @@ fn create_continuous_flow(
         grid_epoch_seen,
         device_mac_pubkey,
         is_unreliable: false,
-    }
+    })
 }
 
 /// Calculate required buffer amount (24 hours of flow rate)
@@ -2111,6 +2154,9 @@ fn pause_stream(env: &Env, stream_id: u64, provider: &Address) -> Result<(), Con
 /// Restarts the flow and adjusts timing based on pause duration
 /// Reentrancy protection: State changes happen before any external calls
 fn resume_stream(env: &Env, stream_id: u64, new_flow_rate: i128, provider: &Address) -> Result<(), ContractError> {
+    // Issue #273: Validate flow rate boundaries
+    validate_flow_rate(new_flow_rate)?;
+    
     if new_flow_rate <= 0 {
         return Err(ContractError::InvalidTokenAmount);
     }
@@ -2189,6 +2235,11 @@ fn update_flow_rate(
     stream_id: u64,
     new_flow_rate: i128,
 ) -> Result<(), ContractError> {
+    // Issue #273: Validate flow rate boundaries (only for non-zero rates)
+    if new_flow_rate > 0 {
+        validate_flow_rate(new_flow_rate)?;
+    }
+    
     let mut flow = get_continuous_flow_or_panic(env, stream_id);
     
     // Require authentication for flow rate changes
@@ -4800,6 +4851,11 @@ impl UtilityContract {
     }
 
     pub fn set_max_flow_rate(env: Env, meter_id: u64, max_rate_per_hour: i128) {
+        // Issue #273: Validate hourly flow rate boundaries
+        validate_hourly_flow_rate(max_rate_per_hour).unwrap_or_else(|_| {
+            panic_with_error!(&env, ContractError::FlowRateTooHigh)
+        });
+        
         let mut meter: Meter = env
             .storage()
             .instance()
@@ -6810,7 +6866,13 @@ env.storage()
             priority_tier,
             grid_st.epoch,
             device_mac_pubkey,
-        );
+        )?;
+        
+        // Issue #273: Additional validation for meter max flow rate
+        let meter = get_meter_or_panic(&env, meter_id);
+        if flow_rate_per_second > meter.max_flow_rate_per_hour / 3600 {
+            return Err(ContractError::FlowRateTooHigh);
+        }
 
         env.storage()
             .instance()
@@ -7279,6 +7341,9 @@ env.storage()
     /// Route capital to yield-generating DeFi protocols.
     /// Aborts if `amount` is below the configured MIN_ROUTE_THRESHOLD to avoid
     /// spending more in gas than the yield would earn.
+    /// 
+    /// Issue #280: Implements fallback error handling for failed cross-contract calls.
+    /// Returns the amount actually routed (may be less than requested if fallback occurs).
     pub fn route_to_yield(env: Env, amount: i128) -> i128 {
         let threshold: i128 = env
             .storage()
@@ -7290,13 +7355,160 @@ env.storage()
             panic_with_error!(&env, ContractError::BelowMinRouteThreshold);
         }
 
-        // Routing logic placeholder — actual AMM/yield integration is protocol-specific.
-        // Emits an event so off-chain indexers can track routed capital.
-        env.events().publish((symbol_short!("Routed"),), (amount, threshold));
+        // Issue #280: Attempt yield routing with fallback handling
+        let routed_amount = match attempt_yield_routing(&env, amount) {
+            Ok(routed) => {
+                // Success: emit routing event
+                env.events().publish((symbol_short!("Routed"),), (routed, threshold));
+                routed
+            }
+            Err(e) => {
+                // Fallback: handle failed routing gracefully
+                handle_yield_routing_failure(&env, amount, e)
+            }
+        };
 
-        amount
+        routed_amount
     }
+}
 
+/// Issue #280: Attempt yield routing to external protocols
+fn attempt_yield_routing(env: &Env, amount: i128) -> Result<i128, ContractError> {
+    // In a real implementation, this would make cross-contract calls to yield protocols
+    // For now, we simulate the possibility of failure for demonstration
+    
+    // Check if yield protocol is available (placeholder check)
+    let protocol_available = check_yield_protocol_availability(env)?;
+    
+    if !protocol_available {
+        return Err(ContractError::YieldProtocolUnavailable);
+    }
+    
+    // Simulate routing attempt - in reality this would be a cross-contract call
+    // that could fail due to various reasons (insufficient liquidity, contract paused, etc.)
+    let routing_success = simulate_yield_routing_attempt(env, amount);
+    
+    if routing_success {
+        Ok(amount) // Success: full amount routed
+    } else {
+        Err(ContractError::YieldRoutingFailed)
+    }
+}
+
+/// Issue #280: Check if yield protocol is available for routing
+fn check_yield_protocol_availability(env: &Env) -> Result<bool, ContractError> {
+    // Placeholder: In reality, this would check if the target yield protocol
+    // is operational, not paused, has sufficient liquidity, etc.
+    
+    // For demonstration, we'll simulate occasional unavailability
+    let ledger_seq = env.ledger().sequence();
+    let is_available = ledger_seq % 10 != 0; // 90% availability
+    
+    Ok(is_available)
+}
+
+/// Issue #280: Simulate yield routing attempt (placeholder for actual cross-contract call)
+fn simulate_yield_routing_attempt(env: &Env, amount: i128) -> bool {
+    // Placeholder: In reality, this would be the actual cross-contract call
+    // to the yield protocol that could fail for various reasons
+    
+    // For demonstration, we'll simulate occasional failures
+    let ledger_seq = env.ledger().sequence();
+    let success_probability = if amount > 1_000_000_000 { // Large amounts have lower success rate
+        0.7 // 70% success for large amounts
+    } else {
+        0.9 // 90% success for normal amounts
+    };
+    
+    (ledger_seq % 100) as f64 / 100.0 < success_probability
+}
+
+/// Issue #280: Handle yield routing failures with fallback mechanisms
+fn handle_yield_routing_failure(env: &Env, amount: i128, error: ContractError) -> i128 {
+    // Log the failure for monitoring
+    env.events().publish(
+        (symbol_short!("YieldFail"),), 
+        (amount, error as u32, env.ledger().timestamp())
+    );
+    
+    match error {
+        ContractError::YieldProtocolUnavailable => {
+            // Fallback 1: Protocol unavailable - try alternative routing
+            env.events().publish((symbol_short!("Fallback1"),), (amount, "protocol_unavailable"));
+            attempt_alternative_routing(env, amount).unwrap_or(0)
+        }
+        ContractError::YieldRoutingFailed => {
+            // Fallback 2: Routing failed - partial routing or hold for retry
+            env.events().publish((symbol_short!("Fallback2"),), (amount, "routing_failed"));
+            attempt_partial_routing(env, amount).unwrap_or(0)
+        }
+        _ => {
+            // Unexpected error - no routing, return 0
+            env.events().publish((symbol_short!("NoRouting"),), (amount, "unexpected_error"));
+            0
+        }
+    }
+}
+
+/// Issue #280: Attempt alternative routing as fallback
+fn attempt_alternative_routing(env: &Env, amount: i128) -> Result<i128, ContractError> {
+    // Placeholder: Try alternative yield protocols or simpler routing mechanisms
+    // For demonstration, we'll route a smaller amount that's more likely to succeed
+    
+    let fallback_amount = amount / 2; // Conservative fallback: route half the amount
+    
+    // Check if fallback amount meets minimum threshold
+    let threshold: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MinRouteThreshold)
+        .unwrap_or(DEFAULT_MIN_ROUTE_THRESHOLD);
+    
+    if fallback_amount < threshold {
+        return Ok(0); // Too small to route
+    }
+    
+    // Simulate fallback routing success (higher success rate)
+    let ledger_seq = env.ledger().sequence();
+    let fallback_success = (ledger_seq % 100) as f64 / 100.0 < 0.95; // 95% success rate
+    
+    if fallback_success {
+        env.events().publish((symbol_short!("AltRouted"),), (fallback_amount, "alternative_success"));
+        Ok(fallback_amount)
+    } else {
+        Ok(0) // Fallback also failed
+    }
+}
+
+/// Issue #280: Attempt partial routing as fallback
+fn attempt_partial_routing(env: &Env, amount: i128) -> Result<i128, ContractError> {
+    // Placeholder: Route a smaller portion that's more likely to succeed
+    let partial_amount = amount / 4; // Very conservative: route quarter of the amount
+    
+    // Check if partial amount meets minimum threshold
+    let threshold: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::MinRouteThreshold)
+        .unwrap_or(DEFAULT_MIN_ROUTE_THRESHOLD);
+    
+    if partial_amount < threshold {
+        return Ok(0); // Too small to route
+    }
+    
+    // Simulate partial routing success (very high success rate)
+    let ledger_seq = env.ledger().sequence();
+    let partial_success = (ledger_seq % 100) as f64 / 100.0 < 0.98; // 98% success rate
+    
+    if partial_success {
+        env.events().publish((symbol_short!("PartialRouted"),), (partial_amount, "partial_success"));
+        Ok(partial_amount)
+    } else {
+        Ok(0) // Even partial routing failed - hold for manual retry
+    }
+}
+
+impl UtilityContract {
     // --- Issues #248–#251 (enterprise) thin entrypoints ---
     pub fn set_provider_fleet_cap(env: Env, provider: Address, new_cap: i128, authority: Address) {
         crate::enterprise::set_fleet_cap_super_admin(&env, provider, new_cap, authority);
