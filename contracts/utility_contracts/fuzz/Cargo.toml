@@ -24,3 +24,15 @@ path = "fuzz_targets/extreme_usage_fuzz.rs"
 [[bin]]
 name = "debt_calculation_fuzz"
 path = "fuzz_targets/debt_calculation_fuzz.rs"
+
+[[bin]]
+name = "flow_rate_overflow_fuzz"
+path = "fuzz_targets/flow_rate_overflow_fuzz.rs"
+
+[[bin]]
+name = "debt_overflow_fuzz"
+path = "fuzz_targets/debt_overflow_fuzz.rs"
+
+[[bin]]
+name = "precision_overflow_fuzz"
+path = "fuzz_targets/precision_overflow_fuzz.rs"
