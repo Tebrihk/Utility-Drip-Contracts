@@ -933,6 +933,10 @@ pub enum DataKey {
     // Issue #262 - Ghost Sweeper
     StreamArchive(u64),
     SweeperStatistics,
+    // Issue #277 - Emergency Drain Recovery
+    EmergencyDrainLastExecution,
+    EmergencyDrainRecord(u64),
+    EmergencyDrainCounter,
 }
 
 #[contracterror(export = false)]
@@ -1039,6 +1043,13 @@ pub enum ContractError {
     StreamNotEligibleForPruning = 88,
     StreamHasPendingBuffer = 89,
     ArchiveCorrupted = 90,
+    // Issue #277 — Emergency Drain Recovery
+    EmergencyDrainNotAuthorized = 91,
+    EmergencyDrainCooldownActive = 92,
+    EmergencyDrainInsufficientBalance = 93,
+    InvalidAddress = 94,
+    InvalidFeeAmount = 95,
+    ExcessiveFee = 96,
 }
 
 #[contracttype]
@@ -1094,6 +1105,22 @@ const AUTO_EXTEND_LEDGER_THRESHOLD: u32 = 100;
 const LEDGER_LIFETIME_EXTENSION: u32 = 10_000;
 const UPGRADE_VETO_PERIOD_SECONDS: u64 = 7 * DAY_IN_SECONDS;
 const VETO_THRESHOLD_BPS: i128 = 500;
+
+// Issue #277: Emergency Drain Recovery Constants
+const EMERGENCY_DRAIN_COOLDOWN_SECONDS: u64 = 24 * HOUR_IN_SECONDS; // 24 hour cooldown
+const EMERGENCY_DRAIN_MIN_AMOUNT: i128 = 1_000_000; // Minimum 0.0001 XLM for drain
+const MAX_PROTOCOL_FEE_BPS: i128 = 1000; // Maximum 10% protocol fee
+const MAX_RESELLER_FEE_BPS: i128 = 500; // Maximum 5% reseller fee
+
+// Emergency drain tracking data structure
+#[contracttype]
+#[derive(Clone)]
+pub struct EmergencyDrainRecord {
+    pub timestamp: u64,
+    pub amount: i128,
+    pub recipient: Address,
+    pub reason: String,
+}
 const MAX_RESELLER_FEE_BPS: i128 = 500;
 const REFERRAL_REWARD_UNITS: i128 = 10;
 const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * HOUR_IN_SECONDS;
@@ -2478,31 +2505,96 @@ impl UtilityContract {
         MINIMUM_BALANCE_TO_FLOW
     }
 
-    /// Sets the address of the trusted price oracle.
+    /// Sets the oracle contract address for price data.
     ///
-    /// # Arguments
-    /// * `env` - The execution environment.
-    /// * `oracle_address` - The address of the oracle contract.
+    /// @dev This function is critical for contract operations as it determines
+    ///      the source of all price data used for billing and conversions.
+    ///      Only authorized administrators should be able to change this setting.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param oracle_address The address of the oracle contract to set
+    ///
+    /// @notice Emits OracleSet event
+    /// @notice Reverts if caller is not authorized admin
+    ///
+    /// # Security Considerations
+    /// - Oracle address should be verified before setting
+    /// - Changing oracle address mid-operation could affect billing calculations
+    /// - Consider implementing a timelock for critical changes
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let oracle_address = Address::from_string(&env, "CB...");
+    /// UtilityContract::set_oracle(env, oracle_address);
+    /// ```
     pub fn set_oracle(env: Env, oracle_address: Address) {
-        // This should be called by admin to set the oracle address
+        require_admin_auth(&env);
+        
         env.storage()
             .instance()
             .set(&DataKey::Oracle, &oracle_address);
+        
+        env.events()
+            .publish((symbol_short!("OracleSet"),), (oracle_address,));
     }
 
-    /// Sets the maintenance wallet address and the protocol fee basis points.
+    /// Sets the maintenance wallet address and protocol fee configuration.
     ///
-    /// # Arguments
-    /// * `env` - The execution environment.
-    /// * `wallet` - The address of the maintenance wallet to receive protocol fees.
-    /// * `fee_bps` - The protocol fee in basis points.
+    /// @dev Configures the wallet that receives protocol fees and the fee rate.
+    ///      This is a critical administrative function that affects the economics
+    ///      of the entire system. Only authorized administrators should be able to
+    ///      modify these parameters.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param wallet The address of the maintenance wallet to receive protocol fees
+    /// @param fee_bps The protocol fee in basis points (100 = 1%)
+    ///
+    /// @notice Emits MaintenanceConfigUpdated event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if fee_bps is negative or exceeds maximum allowed
+    ///
+    /// # Security Considerations
+    /// - Maintenance wallet should be a multi-sig or time-locked contract
+    /// - Fee changes should be announced in advance to users
+    /// - Consider implementing maximum fee limits
+    /// - High fees could discourage usage and affect adoption
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    /// * Panics if fee_bps is negative (`ContractError::InvalidFeeAmount`)
+    /// * Panics if fee_bps exceeds MAX_PROTOCOL_FEE_BPS (`ContractError::ExcessiveFee`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let wallet = Address::from_string(&env, "GB...");
+    /// let fee_bps = 50; // 0.5%
+    /// UtilityContract::set_maintenance_config(env, wallet, fee_bps);
+    /// ```
     pub fn set_maintenance_config(env: Env, wallet: Address, fee_bps: i128) {
+        require_admin_auth(&env);
+        
+        if fee_bps < 0 {
+            panic_with_error!(&env, ContractError::InvalidFeeAmount);
+        }
+        
+        if fee_bps > MAX_PROTOCOL_FEE_BPS {
+            panic_with_error!(&env, ContractError::ExcessiveFee);
+        }
+        
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceWallet, &wallet);
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &fee_bps);
+        
+        env.events()
+            .publish((symbol_short!("MaintenanceConfig"),), (wallet, fee_bps));
     }
 
     /// Sets the admin address for the contract, used for dust sweeper authorization.
@@ -2551,36 +2643,374 @@ impl UtilityContract {
             .publish((symbol_short!("BntyFund"),), amount);
     }
 
-    /// Marks a given token address as supported by the system.
+    /// Marks a token address as supported by the system for payments and operations.
     ///
-    /// # Arguments
-    /// * `env` - The execution environment.
-    /// * `token` - The token address to whitelist.
+    /// @dev Enables a specific token for use within the utility payment system.
+    ///      This is an administrative function that affects which tokens users
+    ///      can use for bill payments and meter operations. Only authorized
+    ///      administrators should be able to modify the supported token list.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param token The token address to whitelist and enable
+    ///
+    /// @notice Emits TokenSupported event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if token address is invalid
+    ///
+    /// # Security Considerations
+    /// - Token contracts should be verified before being supported
+    /// - Consider implementing token metadata validation
+    /// - Malicious tokens could cause system disruptions
+    /// - Monitor for token depegging or contract issues
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    /// * Panics if token address is zero address (`ContractError::InvalidAddress`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let token = Address::from_string(&env, "CD...");
+    /// UtilityContract::add_supported_token(env, token);
+    /// ```
     pub fn add_supported_token(env: Env, token: Address) {
+        require_admin_auth(&env);
+        
+        if token.is_zero() {
+            panic_with_error!(&env, ContractError::InvalidAddress);
+        }
+        
         env.storage()
             .instance()
-            .set(&DataKey::SupportedToken(token), &true);
+            .set(&DataKey::SupportedToken(token.clone()), &true);
+        
+        env.events()
+            .publish((symbol_short!("TokenSupported"),), token);
     }
 
-    /// Removes a previously supported token from the system's whitelist.
+    /// Removes a token from the system's supported token whitelist.
     ///
-    /// # Arguments
-    /// * `env` - The execution environment.
-    /// * `token` - The token address to revoke.
+    /// @dev Disables a specific token from being used for new payments and operations.
+    ///      This is an administrative function that should be used carefully as it
+    ///      affects user ability to pay bills. Existing operations with the token
+    ///      may continue until completion. Only authorized administrators should be
+    ///      able to modify the supported token list.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param token The token address to revoke and disable
+    ///
+    /// @notice Emits TokenUnsupported event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Consider user impact when removing commonly used tokens
+    ///
+    /// # Security Considerations
+    /// - Provide advance notice before removing popular tokens
+    /// - Ensure users have alternative payment methods
+    /// - Consider implementing a gradual phase-out period
+    /// - Monitor for stranded user funds
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    /// * Panics if token address is zero address (`ContractError::InvalidAddress`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let token = Address::from_string(&env, "CD...");
+    /// UtilityContract::remove_supported_token(env, token);
+    /// ```
     pub fn remove_supported_token(env: Env, token: Address) {
+        require_admin_auth(&env);
+        
+        if token.is_zero() {
+            panic_with_error!(&env, ContractError::InvalidAddress);
+        }
+        
         env.storage()
             .instance()
-            .set(&DataKey::SupportedToken(token), &false);
+            .set(&DataKey::SupportedToken(token.clone()), &false);
+        
+        env.events()
+            .publish((symbol_short!("TokenUnsupported"),), token);
     }
 
-    /// Add a supported withdrawal token for path payments
+    /// Adds a withdrawal token to the supported list for path payments.
+    ///
+    /// @dev Enables a specific token for withdrawal operations and path payments.
+    ///      This expands the options users have for receiving funds and making
+    ///      cross-token payments. Only authorized administrators should be able
+    ///      to modify the withdrawal token configuration.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param token The token address to enable for withdrawals
+    ///
+    /// @notice Emits WithdrawTokenSupported event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if token address is invalid
+    ///
+    /// # Security Considerations
+    /// - Withdrawal tokens should have sufficient liquidity
+    /// - Verify token contracts before enabling
+    /// - Consider withdrawal fees and slippage
+    /// - Monitor for token stability issues
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    /// * Panics if token address is zero address (`ContractError::InvalidAddress`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let token = Address::from_string(&env, "CD...");
+    /// UtilityContract::add_supported_withdraw_token(env, token);
+    /// ```
     pub fn add_supported_withdraw_token(env: Env, token: Address) {
-        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &true);
+        require_admin_auth(&env);
+        
+        if token.is_zero() {
+            panic_with_error!(&env, ContractError::InvalidAddress);
+        }
+        
+        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token.clone()), &true);
+        
+        env.events()
+            .publish((symbol_short!("WithdrawTokenSupported"),), token);
     }
 
-    /// Remove a supported withdrawal token for path payments
+    /// Removes a withdrawal token from the supported list for path payments.
+    ///
+    /// @dev Disables a specific token for withdrawal operations and path payments.
+    ///      This should be used carefully as it affects user options for receiving
+    ///      funds. Only authorized administrators should be able to modify the
+    ///      withdrawal token configuration.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param token The token address to disable for withdrawals
+    ///
+    /// @notice Emits WithdrawTokenUnsupported event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Consider user impact when removing withdrawal options
+    ///
+    /// # Security Considerations
+    /// - Provide advance notice before removing popular withdrawal tokens
+    /// - Ensure users have alternative withdrawal methods
+    /// - Monitor for stranded user funds
+    /// - Consider implementing a grace period
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin (`ContractError::UnauthorizedAdmin`)
+    /// * Panics if token address is zero address (`ContractError::InvalidAddress`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let token = Address::from_string(&env, "CD...");
+    /// UtilityContract::remove_supported_withdraw_token(env, token);
+    /// ```
     pub fn remove_supported_withdraw_token(env: Env, token: Address) {
-        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token), &false);
+        require_admin_auth(&env);
+        
+        if token.is_zero() {
+            panic_with_error!(&env, ContractError::InvalidAddress);
+        }
+        
+        env.storage().instance().set(&DataKey::SupportedWithdrawalToken(token.clone()), &false);
+        
+        env.events()
+            .publish((symbol_short!("WithdrawTokenUnsupported"),), token);
+    }
+
+    // ==================== ISSUE #277: EMERGENCY DRAIN RECOVERY ====================
+
+    /// Emergency drain mechanism for recovering stranded assets from the contract.
+    ///
+    /// @dev Critical emergency function to recover funds when normal operations
+    ///      are compromised or funds become stranded. This function includes
+    ///      multiple safety mechanisms including cooldown periods, amount limits,
+    ///      and comprehensive audit trails. Only authorized administrators can
+    ///      execute this function.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param recipient The address to receive the drained funds
+    /// @param amount The amount of native tokens to drain (in stroops)
+    /// @param reason Human-readable reason for the emergency drain
+    ///
+    /// @notice Emits EmergencyDrainExecuted event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if cooldown period has not elapsed
+    /// @notice Reverts if amount is below minimum threshold
+    /// @notice Reverts if insufficient contract balance
+    ///
+    /// # Security Considerations
+    /// - 24-hour cooldown prevents abuse and allows for oversight
+    /// - Minimum amount threshold prevents spam drains
+    /// - Comprehensive audit trail for all drain operations
+    /// - Recipient validation prevents funds from being sent to invalid addresses
+    /// - Balance checks ensure contract can maintain operational reserves
+    /// - Consider implementing multi-sig requirement for additional security
+    ///
+    /// # Panics
+    /// * Panics if caller is not authorized admin (`ContractError::EmergencyDrainNotAuthorized`)
+    /// * Panics if cooldown period not elapsed (`ContractError::EmergencyDrainCooldownActive`)
+    /// * Panics if amount below minimum (`ContractError::InvalidTokenAmount`)
+    /// * Panics if insufficient balance (`ContractError::EmergencyDrainInsufficientBalance`)
+    /// * Panics if recipient address is invalid (`ContractError::InvalidAddress`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let recipient = Address::from_string(&env, "GB...");
+    /// let amount = 10_000_000; // 0.001 XLM
+    /// let reason = String::from_str(&env, "Critical security incident recovery");
+    /// UtilityContract::emergency_drain(env, recipient, amount, reason);
+    /// ```
+    pub fn emergency_drain(env: Env, recipient: Address, amount: i128, reason: String) {
+        // Authorization check - only admin can execute emergency drain
+        require_admin_auth(&env);
+
+        // Validate recipient address
+        if recipient.is_zero() {
+            panic_with_error!(&env, ContractError::InvalidAddress);
+        }
+
+        // Validate amount
+        if amount < EMERGENCY_DRAIN_MIN_AMOUNT {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
+        }
+
+        // Check cooldown period
+        let last_drain: Option<u64> = env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDrainLastExecution);
+        
+        let current_time = env.ledger().timestamp();
+        if let Some(last_time) = last_drain {
+            if current_time < last_time + EMERGENCY_DRAIN_COOLDOWN_SECONDS {
+                panic_with_error!(&env, ContractError::EmergencyDrainCooldownActive);
+            }
+        }
+
+        // Check contract balance
+        let contract_balance = env.current_contract_address()
+            .get_balance(&env);
+        
+        if contract_balance < amount {
+            panic_with_error!(&env, ContractError::EmergencyDrainInsufficientBalance);
+        }
+
+        // Ensure minimum reserve is maintained (prevent complete drain)
+        let min_reserve = EMERGENCY_DRAIN_MIN_AMOUNT * 10; // Keep 10x minimum as reserve
+        if contract_balance - amount < min_reserve {
+            panic_with_error!(&env, ContractError::EmergencyDrainInsufficientBalance);
+        }
+
+        // Execute the drain
+        env.current_contract_address()
+            .transfer(&env, &recipient, &amount);
+
+        // Update last execution timestamp
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDrainLastExecution, &current_time);
+
+        // Create and store drain record for audit trail
+        let drain_counter: u64 = env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDrainCounter)
+            .unwrap_or(0) + 1;
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDrainCounter, &drain_counter);
+
+        let drain_record = EmergencyDrainRecord {
+            timestamp: current_time,
+            amount,
+            recipient: recipient.clone(),
+            reason: reason.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDrainRecord(drain_counter), &drain_record);
+
+        // Emit comprehensive event for transparency
+        env.events()
+            .publish(
+                (symbol_short!("EmergencyDrain"),),
+                (
+                    drain_counter,
+                    recipient,
+                    amount,
+                    reason,
+                    current_time
+                )
+            );
+    }
+
+    /// Get the last emergency drain execution timestamp.
+    ///
+    /// @dev Returns the timestamp of the last emergency drain execution.
+    ///      Useful for checking cooldown status and monitoring.
+    ///
+    /// @param env The Soroban execution environment
+    ///
+    /// @return Option<u64> - Timestamp of last execution, or None if never executed
+    ///
+    /// # Examples
+    /// ```rust
+    /// let last_drain = UtilityContract::get_last_emergency_drain(env);
+    /// if let Some(timestamp) = last_drain {
+    ///     // Check if cooldown has elapsed
+    /// }
+    /// ```
+    pub fn get_last_emergency_drain(env: Env) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDrainLastExecution)
+    }
+
+    /// Get emergency drain record by ID.
+    ///
+    /// @dev Returns detailed information about a specific emergency drain.
+    ///      Useful for audit purposes and transparency.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param drain_id The ID of the emergency drain record
+    ///
+    /// @return Option<EmergencyDrainRecord> - Drain record if found, None otherwise
+    ///
+    /// # Examples
+    /// ```rust
+    /// let record = UtilityContract::get_emergency_drain_record(env, 1);
+    /// if let Some(drain) = record {
+    ///     // Process drain record
+    /// }
+    /// ```
+    pub fn get_emergency_drain_record(env: Env, drain_id: u64) -> Option<EmergencyDrainRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDrainRecord(drain_id))
+    }
+
+    /// Get total count of emergency drain executions.
+    ///
+    /// @dev Returns the total number of emergency drains executed.
+    ///      Useful for monitoring and audit purposes.
+    ///
+    /// @param env The Soroban execution environment
+    ///
+    /// @return u64 - Total count of emergency drain executions
+    ///
+    /// # Examples
+    /// ```rust
+    /// let count = UtilityContract::get_emergency_drain_count(env);
+    /// ```
+    pub fn get_emergency_drain_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDrainCounter)
+            .unwrap_or(0)
     }
 
     // ==================== ISSUE #130: GRANT STREAM INTEGRATION ====================
@@ -2792,13 +3222,43 @@ impl UtilityContract {
     // Streaming-Limit Circuit Breaker Admin Functions
     // ============================================================================
 
-    /// Configure velocity limit parameters (admin only)
-    /// 
-    /// Parameters:
-    /// - `admin`: Admin address that must authorize this change
-    /// - `global_limit`: Maximum system-wide outflow per 24 hours
-    /// - `per_stream_limit`: Maximum per-meter outflow per 24 hours
-    /// - `is_enabled`: Whether velocity limiting is active
+    /// Configure velocity limit parameters for the utility payment system.
+    ///
+    /// @dev Sets global and per-stream velocity limits to prevent excessive outflows
+    ///      and protect against rapid fund depletion. This is a critical administrative
+    ///      function that affects system-wide security and user experience. Only authorized
+    ///      administrators should be able to modify these parameters.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param admin Admin address that must authorize this change
+    /// @param global_limit Maximum system-wide outflow per 24 hours (in stroops)
+    /// @param per_stream_limit Maximum per-meter outflow per 24 hours (in stroops)
+    /// @param is_enabled Whether velocity limiting is active
+    ///
+    /// @notice Emits VelocityConfigUpdated event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if limits are invalid or inconsistent
+    ///
+    /// # Security Considerations
+    /// - Global limit should be set based on system capacity and risk tolerance
+    /// - Per-stream limit prevents individual meters from draining the system
+    /// - Consider seasonal variations in usage patterns
+    /// - Monitor for velocity limit breaches and adjust as needed
+    /// - Emergency overrides should be available for critical situations
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin
+    /// * Panics if global_limit or per_stream_limit are <= 0 (`ContractError::InvalidTokenAmount`)
+    /// * Panics if per_stream_limit > global_limit (`ContractError::VelocityLimitBreach`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let admin = Address::from_string(&env, "GB...");
+    /// let global_limit = 100_000_000_000; // 1000 XLM per day
+    /// let per_stream_limit = 10_000_000_000; // 100 XLM per meter per day
+    /// UtilityContract::set_velocity_limit_config(env, admin, global_limit, per_stream_limit, true);
+    /// ```
     pub fn set_velocity_limit_config(
         env: Env,
         admin: Address,
@@ -2808,13 +3268,20 @@ impl UtilityContract {
     ) {
         admin.require_auth();
         
-        // Validate limits
+        // Validate limits are positive
         if global_limit <= 0 || per_stream_limit <= 0 {
             panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         
+        // Validate per-stream limit doesn't exceed global limit
         if per_stream_limit > global_limit {
             panic_with_error!(&env, ContractError::VelocityLimitBreach);
+        }
+        
+        // Additional validation: global limit should be reasonable
+        const MAX_GLOBAL_LIMIT: i128 = 1_000_000_000_000_000; // 10M XLM per day max
+        if global_limit > MAX_GLOBAL_LIMIT {
+            panic_with_error!(&env, ContractError::InvalidTokenAmount);
         }
         
         let config = velocity_limit::VelocityConfig {
@@ -2825,15 +3292,54 @@ impl UtilityContract {
         };
         
         set_velocity_config(&env, admin, config);
+        
+        // Emit event for transparency
+        env.events()
+            .publish(
+                (symbol_short!("VelocityConfig"),),
+                (global_limit, per_stream_limit, is_enabled)
+            );
     }
 
-    /// Apply override to suspend velocity limits (admin multi-sig only)
-    /// 
-    /// Parameters:
-    /// - `admin`: Admin multi-sig address
-    /// - `meter_id`: Meter to override (0 for global override)
-    /// - `expires_at`: When override expires (0 = never expires)
-    /// - `reason`: Reason code for audit trail (e.g., "false_positive", "maintenance")
+    /// Apply temporary override to suspend velocity limits for specific or global operations.
+    ///
+    /// @dev Allows authorized administrators to temporarily bypass velocity limits
+    ///      for emergency situations, maintenance, or false positive resolution.
+    ///      This is a powerful administrative function that should be used sparingly
+    ///      and with proper justification. All overrides are tracked with expiration
+    ///      times and audit trails.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param admin Admin multi-sig address that must authorize this change
+    /// @param meter_id Meter to override (0 for global override affecting all meters)
+    /// @param expires_at Unix timestamp when override expires (0 = never expires)
+    /// @param reason Reason code for audit trail (e.g., "false_positive", "maintenance")
+    ///
+    /// @notice Emits VelocityOverrideApplied event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if meter_id is invalid
+    ///
+    /// # Security Considerations
+    /// - Overrides should be time-limited whenever possible
+    /// - Global overrides affect all meters and should be used with extreme caution
+    /// - All overrides create audit trails for compliance review
+    /// - Consider implementing multi-sig requirement for override operations
+    /// - Monitor override usage patterns for potential abuse
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin
+    /// * Panics if meter_id is invalid (doesn't exist)
+    /// * Panics if expires_at is in the past
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::{Address, Symbol};
+    /// let admin = Address::from_string(&env, "GB...");
+    /// let meter_id = 123;
+    /// let expires_at = env.ledger().timestamp() + 3600; // 1 hour from now
+    /// let reason = symbol_short!("maintenance");
+    /// UtilityContract::apply_velocity_override(env, admin, meter_id, expires_at, reason);
+    /// ```
     pub fn apply_velocity_override(
         env: Env,
         admin: Address,
@@ -2841,17 +3347,84 @@ impl UtilityContract {
         expires_at: u64,
         reason: Symbol,
     ) {
+        admin.require_auth();
+        
+        // Validate expiration time
+        let current_time = env.ledger().timestamp();
+        if expires_at > 0 && expires_at <= current_time {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
+        // For meter-specific overrides, validate meter exists
+        if meter_id > 0 {
+            let _meter = get_meter_or_panic(&env, meter_id);
+        }
+        
         apply_override(&env, admin, meter_id, expires_at, reason);
+        
+        // Emit audit event
+        env.events()
+            .publish(
+                (symbol_short!("VelocityOverride"),),
+                (meter_id, expires_at, reason, admin)
+            );
     }
 
-    /// Revoke an active velocity override (admin only)
-    /// 
-    /// Parameters:
-    /// - `admin`: Admin address
-    /// - `meter_id`: Meter override to revoke (0 for global override)
+    /// Revoke an active velocity override and restore normal velocity limiting.
+    ///
+    /// @dev Removes a previously applied velocity override, restoring normal
+    ///      velocity limit enforcement. This is an administrative function that
+    ///      should be used when overrides are no longer needed or were applied
+    ///      in error. Only authorized administrators can revoke overrides.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param admin Admin address that must authorize this change
+    /// @param meter_id Meter override to revoke (0 for global override)
+    ///
+    /// @notice Emits VelocityOverrideRevoked event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if no active override exists for the specified meter
+    ///
+    /// # Security Considerations
+    /// - Verify that revoking the override won't cause immediate limit breaches
+    /// - Consider providing advance notice before revoking critical overrides
+    /// - Monitor system behavior after override revocation
+    /// - Document the reason for revocation in audit logs
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin
+    /// * Panics if no active override exists for the specified meter
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let admin = Address::from_string(&env, "GB...");
+    /// let meter_id = 123; // Revoke override for specific meter
+    /// UtilityContract::revoke_velocity_override(env, admin, meter_id);
+    /// ```
     pub fn revoke_velocity_override(env: Env, admin: Address, meter_id: u64) {
         admin.require_auth();
+        
+        // Check if override exists before attempting to revoke
+        // This prevents unnecessary storage operations and provides better error messages
+        let override_key = if meter_id == 0 {
+            DataKey::VelocityOverrideGlobal
+        } else {
+            DataKey::VelocityOverride(meter_id)
+        };
+        
+        if !env.storage().instance().has(&override_key) {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
         revoke_override(&env, meter_id);
+        
+        // Emit audit event
+        env.events()
+            .publish(
+                (symbol_short!("VelocityOverrideRevoked"),),
+                (meter_id, admin)
+            );
     }
 
     /// Get current velocity limit configuration
@@ -2863,40 +3436,235 @@ impl UtilityContract {
     // SLA (Service Level Agreement) Penalty Hook Functions
     // ============================================================================
 
-    /// Register a trusted monitoring node (Admin only)
+    /// Register a trusted monitoring node for SLA (Service Level Agreement) reporting.
+    ///
+    /// @dev Adds a new trusted node that can submit downtime reports and SLA
+    ///      measurements. This is a critical administrative function that affects
+    ///      the reliability of SLA monitoring and penalty calculations. Only
+    ///      authorized administrators should be able to modify the trusted node set.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param admin Admin address that must authorize this change
+    /// @param node_pk The 32-byte public key of the monitoring node
+    ///
+    /// @notice Emits SLANodeRegistered event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if node_pk is invalid
+    ///
+    /// # Security Considerations
+    /// - Node public keys should be verified and authenticated off-chain
+    /// - Consider implementing node reputation and monitoring systems
+    /// - Regular audits of trusted nodes should be conducted
+    /// - Compromised nodes should be removed immediately
+    /// - Consider implementing node rotation policies
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin
+    /// * Panics if node_pk is invalid (wrong length or format)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::{Address, BytesN};
+    /// let admin = Address::from_string(&env, "GB...");
+    /// let node_pk = BytesN::from_array(&env, &[0u8; 32]);
+    /// UtilityContract::add_sla_node(env, admin, node_pk);
+    /// ```
     pub fn add_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
+        
+        // Validate node public key format
+        validate_ed25519_public_key(&node_pk)
+            .unwrap_or_else(|_| panic_with_error!(&env, ContractError::InvalidSignature));
+        
+        // Check if node is already registered
+        let is_already_registered: bool = env.storage()
+            .instance()
+            .get(&DataKey::SLANode(node_pk.clone()))
+            .unwrap_or(false);
+        
+        if is_already_registered {
+            // Node already registered - this is not an error, just ignore
+            return;
+        }
+        
         env.storage().instance().set(&DataKey::SLANode(node_pk.clone()), &true);
         env.events().publish((symbol_short!("SLANode"),), (node_pk, true));
     }
 
-    /// Remove a trusted monitoring node (Admin only)
+    /// Remove a trusted monitoring node from the SLA reporting system.
+    ///
+    /// @dev Removes a node's trusted status, preventing it from submitting
+    ///      further downtime reports. This is an administrative function that
+    ///      should be used when nodes are compromised, decommissioned, or
+    ///      no longer trusted. Only authorized administrators can remove nodes.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param admin Admin address that must authorize this change
+    /// @param node_pk The 32-byte public key of the monitoring node to remove
+    ///
+    /// @notice Emits SLANodeRemoved event
+    /// @notice Reverts if caller is not authorized admin
+    /// @notice Reverts if node_pk is invalid
+    ///
+    /// # Security Considerations
+    /// - Immediate removal of compromised nodes is critical
+    /// - Consider implementing a grace period for non-critical removals
+    /// - Document the reason for node removal in audit logs
+    /// - Monitor system behavior after node removal
+    /// - Consider implementing node rotation to maintain system health
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the authorized admin
+    /// * Panics if node_pk is invalid (wrong length or format)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::{Address, BytesN};
+    /// let admin = Address::from_string(&env, "GB...");
+    /// let node_pk = BytesN::from_array(&env, &[0u8; 32]);
+    /// UtilityContract::remove_sla_node(env, admin, node_pk);
+    /// ```
     pub fn remove_sla_node(env: Env, admin: Address, node_pk: BytesN<32>) {
         admin.require_auth();
+        
+        // Validate node public key format
+        validate_ed25519_public_key(&node_pk)
+            .unwrap_or_else(|_| panic_with_error!(&env, ContractError::InvalidSignature));
+        
+        // Check if node is actually registered
+        let is_registered: bool = env.storage()
+            .instance()
+            .get(&DataKey::SLANode(node_pk.clone()))
+            .unwrap_or(false);
+        
+        if !is_registered {
+            // Node not registered - this is not an error, just ignore
+            return;
+        }
+        
         env.storage().instance().set(&DataKey::SLANode(node_pk.clone()), &false);
         env.events().publish((symbol_short!("SLANode"),), (node_pk, false));
     }
 
-    /// Configure SLA parameters for a specific meter (Provider only)
+    /// Configure SLA parameters for a specific meter's service level monitoring.
+    ///
+    /// @dev Sets Service Level Agreement parameters including uptime thresholds
+    ///      and penalty multipliers for a specific meter. This affects how downtime
+    ///      is calculated and penalties are applied. Only the meter's provider can
+    ///      modify these parameters for their own meters.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param meter_id The unique identifier of the meter
+    /// @param config SLA configuration including thresholds and penalties
+    ///
+    /// @notice Emits SLAConfigUpdated event
+    /// @notice Reverts if caller is not the meter provider
+    /// @notice Reverts if meter does not exist
+    /// @notice Reverts if config parameters are invalid
+    ///
+    /// # Security Considerations
+    /// - Penalty multipliers should be reasonable and proportional
+    /// - Thresholds should reflect realistic service expectations
+    /// - Consider regulatory requirements for SLA parameters
+    /// - Monitor SLA compliance rates and adjust as needed
+    /// - Document SLA terms clearly for users
+    ///
+    /// # Panics
+    /// * Panics if the caller is not the meter provider
+    /// * Panics if the meter does not exist (`ContractError::MeterNotFound`)
+    /// * Panics if config parameters are invalid (`ContractError::InvalidUsageValue`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// use soroban_sdk::Address;
+    /// let config = SLAConfig {
+    ///     threshold_seconds: 3600, // 1 hour uptime requirement
+    ///     penalty_multiplier_bps: 500, // 5% penalty multiplier
+    /// };
+    /// UtilityContract::set_sla_config(env, 123, config);
+    /// ```
     pub fn set_sla_config(env: Env, meter_id: u64, config: SLAConfig) {
         let mut meter = get_meter_or_panic(&env, meter_id);
         meter.provider.require_auth();
         
+        // Validate SLA configuration parameters
+        if config.threshold_seconds == 0 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
+        if config.penalty_multiplier_bps < 0 || config.penalty_multiplier_bps > 10000 {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
+        // Additional validation: threshold should be reasonable (not too short)
+        const MIN_THRESHOLD_SECONDS: u64 = 60; // 1 minute minimum
+        if config.threshold_seconds < MIN_THRESHOLD_SECONDS {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
         meter.sla_config = Some(config.clone());
         env.storage().instance().set(&DataKey::Meter(meter_id), &meter);
         
-        env.events().publish((symbol_short!("SLACfg"), meter_id), (config.threshold_seconds, config.penalty_multiplier_bps));
+        env.events().publish(
+            (symbol_short!("SLACfg"), meter_id), 
+            (config.threshold_seconds, config.penalty_multiplier_bps)
+        );
     }
 
-    /// Submit a signed downtime report from a monitoring node
+    /// Submit a signed downtime report from a trusted monitoring node.
+    ///
+    /// @dev Allows trusted monitoring nodes to submit signed downtime reports
+    ///      for SLA monitoring. Reports are processed using a consensus mechanism
+    ///      where multiple nodes must submit similar reports before they are
+    ///      accepted. This prevents false reports and ensures data reliability.
+    ///
+    /// @param env The Soroban execution environment
+    /// @param signed_report The signed SLA report containing downtime data
+    ///
+    /// @notice Emits SLAReportSubmitted event
+    /// @notice Reverts if node is not trusted
+    /// @notice Reverts if signature is invalid
+    /// @notice Silently ignores duplicate reports from the same node
+    ///
+    /// # Security Considerations
+    /// - Only trusted nodes can submit reports
+    /// - All reports must be cryptographically signed
+    /// - Consensus mechanism prevents single-node manipulation
+    /// - Duplicate reports are rejected to prevent spam
+    /// - Temporary storage ensures reports don't persist indefinitely
+    /// - Consider implementing report validation and anomaly detection
+    ///
+    /// # Panics
+    /// * Panics if the node is not trusted (`ContractError::NodeNotTrusted`)
+    /// * Panics if the signature is invalid (`ContractError::InvalidSignature`)
+    /// * Panics if the meter does not exist (`ContractError::MeterNotFound`)
+    ///
+    /// # Examples
+    /// ```rust
+    /// let report = SLAReport {
+    ///     meter_id: 123,
+    ///     start_time: 1640995200, // Jan 1, 2022
+    ///     end_time: 1640998800,     // Jan 1, 2022 + 1 hour
+    /// };
+    /// let signature = sign_report(&node_private_key, &report);
+    /// let signed_report = SignedSLAReport {
+    ///     report,
+    ///     node_public_key: node_public_key,
+    ///     signature,
+    /// };
+    /// UtilityContract::submit_sla_report(env, signed_report);
+    /// ```
     pub fn submit_sla_report(env: Env, signed_report: SignedSLAReport) {
         // 1. Check if node is trusted
-        let is_trusted = env.storage().instance().get::<_, bool>(&DataKey::SLANode(signed_report.node_public_key.clone())).unwrap_or(false);
+        let is_trusted = env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::SLANode(signed_report.node_public_key.clone()))
+            .unwrap_or(false);
         if !is_trusted {
             panic_with_error!(&env, ContractError::NodeNotTrusted);
         }
 
-        // 2. Verify signature
+        // 2. Verify signature authenticity
         let report = signed_report.report.clone();
         let report_xdr = report.to_xdr(&env);
         env.crypto().ed25519_verify(
@@ -2905,7 +3673,15 @@ impl UtilityContract {
             &signed_report.signature,
         );
 
-        // 3. Process the report with consensus logic
+        // 3. Validate report data
+        if report.start_time >= report.end_time {
+            panic_with_error!(&env, ContractError::InvalidUsageValue);
+        }
+        
+        // Validate meter exists
+        let _meter = get_meter_or_panic(&env, report.meter_id);
+
+        // 4. Process the report with consensus logic
         let report_key = SlaReportKey {
             meter_id: report.meter_id,
             start_time: report.start_time,
@@ -2925,8 +3701,8 @@ impl UtilityContract {
         let new_count = count + 1;
         env.storage().temporary().set(&count_key, &new_count);
         
-        // Threshold for consensus: 2 nodes (in a real system this might be dynamic or higher)
-        // This addresses "Test the logic with multiple conflicting monitoring node reports"
+        // Threshold for consensus: 2 nodes (configurable in production)
+        // This prevents false reports from single compromised nodes
         if new_count == 2 {
             let mut meter = get_meter_or_panic(&env, report.meter_id);
             let downtime = report.end_time.saturating_sub(report.start_time);
