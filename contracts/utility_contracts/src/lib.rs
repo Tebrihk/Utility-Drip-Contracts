@@ -304,6 +304,12 @@ pub mod nonce_sync;
 pub mod tariff_oracle;
 pub mod ghost_sweeper;
 pub mod temporary_storage;
+
+#[cfg(test)]
+pub mod gas_metrics;
+
+#[cfg(test)]
+mod stream_balance_property_tests;
 use velocity_limit::{check_velocity_limits, apply_override, revoke_override, get_velocity_config, set_velocity_config, VelocityDataKey};
 use temporary_storage::{TempStorageManager, OptimizedFlowCalculator, OptimizedUsageTracker};
 #[contracttype]
@@ -895,6 +901,7 @@ pub enum DataKey {
     SLAReportCount(SlaReportKey),
     SLAReportNode(SlaReportKey, BytesN<32>),
     StreamLastHeartbeat(u64),
+    StreamCreationRateLimit(Address),
     StreamingFeeAccrued(u64),
     SubDaoConfig(Address),
     SupportedToken(Address),
@@ -1050,6 +1057,7 @@ pub enum ContractError {
     InvalidAddress = 94,
     InvalidFeeAmount = 95,
     ExcessiveFee = 96,
+    RateLimitExceeded = 97,
 }
 
 #[contracttype]
@@ -1058,6 +1066,13 @@ pub struct PairingChallengeData {
     pub contract: Address,
     pub meter_id: u64,
     pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RateLimitData {
+    pub count: u32,
+    pub last_reset: u64,
 }
 
 // --- Internal Helpers ---
@@ -1123,6 +1138,10 @@ pub struct EmergencyDrainRecord {
 }
 const MAX_RESELLER_FEE_BPS: i128 = 500;
 const REFERRAL_REWARD_UNITS: i128 = 10;
+
+// Rate limiting for stream creation
+const STREAM_CREATION_RATE_LIMIT: u32 = 10; // Max 10 streams per window
+const STREAM_CREATION_WINDOW_SECONDS: u64 = 3600; // 1 hour window
 const ADMIN_TRANSFER_TIMELOCK: u64 = 48 * HOUR_IN_SECONDS;
 const MIN_FINANCE_WALLETS: u32 = 3;
 const MAX_FINANCE_WALLETS: u32 = 5;
@@ -1982,7 +2001,65 @@ fn create_continuous_flow(
 
 /// Calculate required buffer amount (24 hours of flow rate)
 fn calculate_required_buffer(flow_rate_per_second: i128) -> i128 {
-    let buffer_duration_i128 = BUFFER_DURATION_SECONDS as i128;
+    lheck and update rate limit for stream creation
+fn check_stream_creation_rate_limit(env: &Env, provider: &Address) {
+    let current_time = env.ledger().timestamp();
+    let key = DataKey::StreamCreationRateLimit(provider.clone());
+    
+    let mut rate_data = env.storage().instance().get(&key).unwrap_or(RateLimitData {
+        count: 0,
+        last_reset: current_time,
+    });
+    
+    // Reset count if window has passed
+    if current_time.saturating_sub(rate_data.last_reset) >= STREAM_CREATION_WINDOW_SECONDS {
+        rate_data.count = 0;
+        rate_data.last_reset = current_time;
+    }
+    
+    // Check if limit exceeded
+    if rate_data.count >= STREAM_CREATION_RATE_LIMIT {
+        panic_with_error!(env, ContractError::RateLimitExceeded);
+    }
+    
+    // Increment count
+    rate_data.count += 1;
+    
+    // Store updated data
+    env.storage().instance().set(&key, &rate_data);
+}
+
+/// Check and update rate limit for stream creation
+fn check_stream_creation_rate_limit(env: &Env, provider: &Address) -> Result<(), ContractError> {
+    let current_time = env.ledger().timestamp();
+    let key = DataKey::StreamCreationRateLimit(provider.clone());
+    
+    let mut rate_data = env.storage().instance().get(&key).unwrap_or(RateLimitData {
+        count: 0,
+        last_reset: current_time,
+    });
+    
+    // Reset count if window has passed
+    if current_time.saturating_sub(rate_data.last_reset) >= STREAM_CREATION_WINDOW_SECONDS {
+        rate_data.count = 0;
+        rate_data.last_reset = current_time;
+    }
+    
+    // Check if limit exceeded
+    if rate_data.count >= STREAM_CREATION_RATE_LIMIT {
+        return Err(ContractError::RateLimitExceeded);
+    }
+    
+    // Increment count
+    rate_data.count += 1;
+    
+    // Store updated data
+    env.storage().instance().set(&key, &rate_data);
+    
+    Ok(())
+}
+
+/// Cet buffer_duration_i128 = BUFFER_DURATION_SECONDS as i128;
     flow_rate_per_second.saturating_mul(buffer_duration_i128)
 }
 
@@ -6782,6 +6859,9 @@ env.storage()
 
         if !privacy_meters.contains(&meter_id) {
             privacy_meters.push_back(meter_id);
+        // Rate limiting check
+        check_stream_creation_rate_limit(&env, &provider);
+        
             env.storage()
                 .instance()
                 .set(&DataKey::ZKEnabledMeters, &privacy_meters);
@@ -6810,6 +6890,9 @@ env.storage()
 
         let mut privacy_status: PrivateBillingStatus = env
             .storage()
+        // Rate limiting check
+        check_stream_creation_rate_limit(&env, &provider)?;
+        
             .instance()
             .get(&DataKey::PrivateBillingStatus(meter_id))
             .unwrap_or(PrivateBillingStatus {

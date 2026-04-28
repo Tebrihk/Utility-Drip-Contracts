@@ -14,3 +14,5 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 cargo-fuzz = "0.11"
+proptest = "1.4"
+lazy_static = "1.4"
